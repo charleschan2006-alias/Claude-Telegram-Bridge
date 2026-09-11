@@ -550,6 +550,20 @@ pub(crate) fn run_prompt_context<R: Read>(reader: &mut R) -> Value {
 
 pub(crate) fn run_approval_gate<R: Read>(reader: &mut R, now: u64) -> Result<Value> {
     let payload = read_hook_payload(reader, "PermissionRequest")?;
+    // AskUserQuestion is owned end to end by the question gates: PreToolUse
+    // `question-gate` pushes the actual CHOICES to the phone and PostToolUse
+    // `question-answered-gate` records the pick. A PermissionRequest for it is
+    // pure noise — the tool only asks the user and has nothing to gate — yet it
+    // used to walk the full approval path and push a SECOND "allow
+    // AskUserQuestion?" message, already stale by the time the choice was
+    // tapped ("这个按钮已经处理过了"; 116 such rows measured 2026-09-11). Allow it
+    // outright, before away/watch/DB, so the phone gets ONE message (the
+    // choices) and the pty renders the selector directly, with no
+    // yes/always/no permission dialog in front of it.
+    if payload.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion") {
+        return Ok(GateKind::Interactive
+            .allow("AskUserQuestion is answered through the question gate, not a permission"));
+    }
     gate_tool_call(&payload, GateKind::Interactive, now)
 }
 
@@ -1088,8 +1102,12 @@ fn wait_out_approval_window(
 
 /// `AskUserQuestion` asked from Telegram. Registered as a `PreToolUse` hook
 /// with `matcher: "AskUserQuestion"`, because no hook can take over the
-/// question dialog itself and `PermissionRequest` never fires for it (asking
-/// is not a permission-gated action).
+/// question dialog itself, and `PreToolUse` is the only event whose return can
+/// carry the answer (`updatedInput`). `PermissionRequest` DOES also fire for
+/// it — a background fork raises a permission prompt for the tool — but that
+/// request carries no answer and is pure noise, so `run_approval_gate` allows
+/// it outright without a push (measured 2026-09-11: 116 redundant approval rows
+/// before that short-circuit; see the note there).
 ///
 /// The answer goes back through the tool's own contract — `allow` plus an
 /// `updatedInput` carrying an `answers` map — so the call completes with the
@@ -2318,6 +2336,42 @@ mod tests {
             gate(payload),
             json!({}),
             "a Telegram-started turn must not block on its own approval"
+        );
+    }
+
+    /// AskUserQuestion must never reach the approval path: the question gate
+    /// already pushes the CHOICES, so a second "allow AskUserQuestion?" message
+    /// is redundant and stale by the time the choice is tapped (116 such rows
+    /// measured 2026-09-11). Even with away ON — where every other gated tool
+    /// WOULD be pushed — it is allowed immediately and creates no approval.
+    #[test]
+    fn ask_user_question_is_allowed_without_a_permission_push() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("askq", true, 5);
+        let mut payload = bash_payload();
+        payload["tool_name"] = json!("AskUserQuestion");
+        payload["tool_input"] = json!({ "questions": [] });
+
+        let started = std::time::Instant::now();
+        let out = gate(payload);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "must be immediate, never a held approval"
+        );
+        assert_eq!(
+            out["hookSpecificOutput"]["decision"]["behavior"],
+            json!("allow"),
+            "{out}"
+        );
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let approvals: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_approvals", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(
+            approvals, 0,
+            "no permission request may be pushed for AskUserQuestion"
         );
     }
 
