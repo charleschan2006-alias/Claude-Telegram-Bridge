@@ -671,7 +671,14 @@ fn deliver_prepared_telegram_delivery(
             .pointer("/result/message_id")
             .and_then(Value::as_i64)
             .context("Telegram sendMessage response missing result.message_id")?;
-        if let Some(thread_id) = prepared.thread_id.as_deref() {
+        // A notify-only question message (a tab the phone cannot answer) gets
+        // NO reply route: a reply to it is not an answer to anything and must
+        // not land in the session as a prompt.
+        if let Some(thread_id) = prepared
+            .thread_id
+            .as_deref()
+            .filter(|_| !prepared.notify_only)
+        {
             insert_telegram_message_route(
                 conn,
                 &telegram.chat_id,
@@ -2687,6 +2694,54 @@ fn inject_native_attach_answer(
                 false,
             ));
         }
+        // Its digit is already in its tab; typing again would land a second
+        // digit in a LATER tab. The batch submit will record the real answer.
+        crate::state::QuestionStatus::Delivered => {
+            // Its digit is already in its tab: never type again. But a batch
+            // may be parked on Submit — an auto-submit that could not be
+            // confirmed (`SubmitPending`) — so a tap on a delivered batch tab
+            // performs a submit-only recovery. A single question has nothing
+            // to recover.
+            let Some(batch) = prompt.batch else {
+                return Ok((
+                    "这题的选择已经送进对话框了，等它提交后记录。".to_string(),
+                    ApprovalAnswer::Delivered,
+                    false,
+                ));
+            };
+            // Ours as long as the row is still this fork's live question —
+            // delivered or open, but not answered/expired/gone.
+            let still_ours = || {
+                matches!(
+                    crate::state::pending_question_status(conn, question_id, now),
+                    Ok(crate::state::QuestionStatus::Open)
+                        | Ok(crate::state::QuestionStatus::Delivered)
+                )
+            };
+            return Ok(
+                match crate::fork_dialog::inject_submit_only(
+                    &prompt.thread_id,
+                    batch.total,
+                    still_ours,
+                ) {
+                    Ok(crate::fork_dialog::InjectOutcome::Delivered) => (
+                        format!("已提交全部 {} 题，等 fork 确认后记录。", batch.total),
+                        ApprovalAnswer::Delivered,
+                        false,
+                    ),
+                    // Not submitted: still tabs to answer, no dialog, or a bar
+                    // we could not trust — keep the button live to try again.
+                    Ok(crate::fork_dialog::InjectOutcome::SubmitPending)
+                    | Ok(crate::fork_dialog::InjectOutcome::Unreachable)
+                    | Err(_) => (
+                        "这题的选择已在对话框里；对话框还没提交或还有题没答——全部答完后再点一次可触发提交。"
+                            .to_string(),
+                        ApprovalAnswer::Delivered,
+                        true,
+                    ),
+                },
+            );
+        }
         crate::state::QuestionStatus::Open => {}
     }
     let resolved = crate::approvals::resolve_answer(answer, &prompt.options);
@@ -2720,12 +2775,43 @@ fn inject_native_attach_answer(
             .map(|status| status == crate::state::QuestionStatus::Open)
             .unwrap_or(false)
     };
-    match crate::fork_dialog::inject_option(&prompt.thread_id, index, true, still_open) {
-        Ok(crate::fork_dialog::InjectOutcome::Delivered) => Ok((
-            format!("已把「{resolved}」送到电脑上的对话框，由它确认后记录。"),
-            ApprovalAnswer::Delivered,
-            false,
-        )),
+    // A tab of a multi-question call carries its tab index: the injector
+    // navigates there first, so the phone may answer the tabs in any order.
+    let multi = prompt.batch.map(|b| crate::fork_dialog::MultiTab {
+        seq: b.seq,
+        total: b.total,
+    });
+    match crate::fork_dialog::inject_option(&prompt.thread_id, index, true, multi, still_open) {
+        Ok(crate::fork_dialog::InjectOutcome::Delivered) => {
+            // The digit is in its tab: a re-tap now reads `Delivered` and types
+            // nothing more. Still not an ANSWER — the PostToolUse hook records
+            // that when the fork submits.
+            crate::state::mark_question_delivered(conn, question_id, now)?;
+            let toast = match prompt.batch {
+                Some(b) => format!(
+                    "已把「{resolved}」送进第 {}/{} 问；全部答完会自动提交并记录。",
+                    b.seq + 1,
+                    b.total
+                ),
+                None => format!("已把「{resolved}」送到电脑上的对话框，由它确认后记录。"),
+            };
+            Ok((toast, ApprovalAnswer::Delivered, false))
+        }
+        Ok(crate::fork_dialog::InjectOutcome::SubmitPending) => {
+            // The digit is in (never retype), but the batch's submit could not
+            // be confirmed. Keep the button LIVE: a later tap on it — status
+            // `Delivered` — performs the submit-only recovery.
+            crate::state::mark_question_delivered(conn, question_id, now)?;
+            let toast = match prompt.batch {
+                Some(b) => format!(
+                    "已把「{resolved}」送进第 {}/{} 问，但对话框还没确认提交——全部答完后再点一次这题可触发提交。",
+                    b.seq + 1,
+                    b.total
+                ),
+                None => "已送到对话框，提交待确认（可再点一次）。".to_string(),
+            };
+            Ok((toast, ApprovalAnswer::Delivered, true))
+        }
         Ok(crate::fork_dialog::InjectOutcome::Unreachable) => Ok((
             "没能连上对话框，请在电脑窗口作答（未记录，可重试）。".to_string(),
             ApprovalAnswer::Unknown,

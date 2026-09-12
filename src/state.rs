@@ -917,6 +917,18 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     // this first-hand, so the phone side reads the flag instead of re-guessing
     // from /proc at tap time.
     ensure_column(conn, "pending_questions", "native_attach", "INTEGER")?;
+    // A multi-question AskUserQuestion call (0.2.16): the gate releases ALL of
+    // its questions as ONE batch — one row per question, sharing `batch_id`
+    // (the call's tool_use_id), with `batch_seq` = the question's tab index and
+    // `batch_total` = how many tabs. The phone answers any of them in any
+    // order; the injector navigates to that tab. `delivered_at` marks a row
+    // whose digit has been typed into its tab (so a re-tap does not type
+    // again), distinct from `answer`, which only the authoritative PostToolUse
+    // hook writes once the whole batch is submitted.
+    ensure_column(conn, "pending_questions", "batch_id", "TEXT")?;
+    ensure_column(conn, "pending_questions", "batch_seq", "INTEGER")?;
+    ensure_column(conn, "pending_questions", "batch_total", "INTEGER")?;
+    ensure_column(conn, "pending_questions", "delivered_at", "INTEGER")?;
     ensure_column(conn, "pending_prompts", "transcript_bytes", "INTEGER")?;
     ensure_column(conn, "pending_prompts", "notification_type", "TEXT")?;
     // WHICH INSTANCE of a prompt this row is. The id is `notify:{received_at}`
@@ -3641,6 +3653,42 @@ pub(crate) fn mark_question_native_attach(conn: &Connection, question_id: &str) 
     Ok(())
 }
 
+/// Stamp a row as ONE tab of a multi-question call (0.2.16): `batch_id` groups
+/// the call's rows (its tool_use_id), `seq` is this question's 0-based tab
+/// index, `total` the tab count. Set right after creation, in the same
+/// transaction, like `mark_question_native_attach`.
+pub(crate) fn set_question_batch(
+    conn: &Connection,
+    question_id: &str,
+    batch_id: &str,
+    seq: usize,
+    total: usize,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_questions SET batch_id = ?2, batch_seq = ?3, batch_total = ?4
+         WHERE question_id = ?1",
+        params![question_id, batch_id, seq as i64, total as i64],
+    )?;
+    Ok(())
+}
+
+/// The phone's digit for this row has been typed into its tab. NOT an answer —
+/// only the PostToolUse hook records answers, once the whole batch is
+/// submitted — but a re-tap must not type a second digit, so from now on the
+/// row reads `QuestionStatus::Delivered`. Idempotent.
+pub(crate) fn mark_question_delivered(
+    conn: &Connection,
+    question_id: &str,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_questions SET delivered_at = ?2
+         WHERE question_id = ?1 AND delivered_at IS NULL",
+        params![question_id, to_sql_i64(now)?],
+    )?;
+    Ok(())
+}
+
 /// A prompt that is still WAITING on the user: its hook is blocked polling
 /// the row this very moment, so a fresh set of answer buttons — on a
 /// /threads message, say — feeds the same row and works exactly like the
@@ -3748,9 +3796,18 @@ pub(crate) fn open_prompts(
     // still legitimately answer.
     let mut questions = conn.prepare(
         "SELECT thread_id, question_id, question, options_json, multi_select
-         FROM pending_questions
-         WHERE answer IS NULL AND expires_at >= ?1
-         ORDER BY created_at ASC",
+         FROM pending_questions AS q
+         WHERE q.answer IS NULL AND q.expires_at >= ?1
+           AND (q.delivered_at IS NULL
+                -- A delivered tab is re-offered ONLY when its whole batch is
+                -- delivered and none of it is answered yet: the dialog is then
+                -- parked on Submit waiting for someone to press Enter, and
+                -- this row's tap performs that submit (nothing is retyped).
+                OR (q.batch_id IS NOT NULL AND NOT EXISTS (
+                      SELECT 1 FROM pending_questions AS s
+                      WHERE s.batch_id = q.batch_id AND s.thread_id = q.thread_id
+                        AND (s.delivered_at IS NULL OR s.answer IS NOT NULL))))
+         ORDER BY q.created_at ASC, COALESCE(q.batch_seq, 0) DESC",
     )?;
     let rows = questions.query_map(params![to_sql_i64(now)?], |row| {
         Ok((
@@ -3765,6 +3822,10 @@ pub(crate) fn open_prompts(
         let (thread_id, question_id, question, options_json, multi_select) = row?;
         let options = serde_json::from_str::<Vec<String>>(&options_json).unwrap_or_default();
         // ASC iteration + insert: the newest open question per thread wins.
+        // Within a multi-question batch (one created_at) the LOWEST tab wins —
+        // DESC in the query, so it is inserted last — and a tab whose digit is
+        // already delivered (0.2.16) is not re-offered at all: only the next
+        // tab still to answer is.
         // A legacy NULL (row created before the column existed) is treated
         // as multi-select, i.e. NO one-tap buttons: guessing "single" could
         // submit one option of what was really a multi-select and silently
@@ -3844,6 +3905,15 @@ pub(crate) fn question_answer(conn: &Connection, question_id: &str) -> Result<Op
 /// the daemon needs to inject a phone answer into the fork's native dialog:
 /// the thread id is the fork to attach, the options give the answer's index
 /// and the presence signatures.
+/// One tab of a multi-question call: which tab this row is (`seq`, 0-based)
+/// out of how many (`total`). The native dialog for such a call is ONE box
+/// with a tab bar; the injector navigates to `seq` before typing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QuestionBatch {
+    pub(crate) seq: usize,
+    pub(crate) total: usize,
+}
+
 pub(crate) struct QuestionPrompt {
     pub(crate) thread_id: String,
     pub(crate) options: Vec<String>,
@@ -3853,25 +3923,60 @@ pub(crate) struct QuestionPrompt {
     /// is set only for single-select questions, so it already implies the
     /// answer is a single option, not a multi-select set.
     pub(crate) native_attach: bool,
+    /// `Some` when this row is one tab of a multi-question call; `None` for an
+    /// ordinary single-question row, whose dialog has no tab bar. (Whether the
+    /// tab's digit was already typed is a STATUS — `QuestionStatus::Delivered`
+    /// from `pending_question_status` — not a prompt field.)
+    pub(crate) batch: Option<QuestionBatch>,
 }
 
 pub(crate) fn question_prompt(
     conn: &Connection,
     question_id: &str,
 ) -> Result<Option<QuestionPrompt>> {
-    let row: Option<(String, String, Option<i64>)> = conn
+    type PromptRow = (
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    );
+    let row: Option<PromptRow> = conn
         .query_row(
-            "SELECT thread_id, options_json, native_attach
+            "SELECT thread_id, options_json, native_attach, batch_seq, batch_total, delivered_at
              FROM pending_questions WHERE question_id = ?1",
             params![question_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .optional()?;
-    Ok(row.map(|(thread_id, options_json, native)| QuestionPrompt {
-        thread_id,
-        options: serde_json::from_str::<Vec<String>>(&options_json).unwrap_or_default(),
-        native_attach: native.unwrap_or(0) != 0,
-    }))
+    Ok(row.map(
+        |(thread_id, options_json, native, seq, total, _delivered_at)| QuestionPrompt {
+            thread_id,
+            options: serde_json::from_str::<Vec<String>>(&options_json).unwrap_or_default(),
+            native_attach: native.unwrap_or(0) != 0,
+            // A batch needs a real tab index and MORE than one tab; anything
+            // else is an ordinary single-question row.
+            batch: match (seq, total) {
+                (Some(seq), Some(total)) if seq >= 0 && total > 1 && seq < total => {
+                    Some(QuestionBatch {
+                        seq: seq as usize,
+                        total: total as usize,
+                    })
+                }
+                _ => None,
+            },
+        },
+    ))
 }
 
 /// Same one-answer-only contract as approvals: the first answer wins, and an
@@ -3945,6 +4050,10 @@ pub(crate) enum QuestionStatus {
     /// Past its deadline — the sentinel is written, or `now` is beyond
     /// `expires_at`.
     Expired,
+    /// Its digit was typed into its tab (`delivered_at` set) but the batch is
+    /// not submitted yet, so no answer is recorded — a re-tap must NOT type a
+    /// second digit.
+    Delivered,
     /// Still open for an answer.
     Open,
 }
@@ -3954,14 +4063,14 @@ pub(crate) fn pending_question_status(
     question_id: &str,
     now: u64,
 ) -> Result<QuestionStatus> {
-    let row: Option<(Option<String>, i64)> = conn
+    let row: Option<(Option<String>, i64, Option<i64>)> = conn
         .query_row(
-            "SELECT answer, expires_at FROM pending_questions WHERE question_id = ?1",
+            "SELECT answer, expires_at, delivered_at FROM pending_questions WHERE question_id = ?1",
             params![question_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((answer, expires_at)) = row else {
+    let Some((answer, expires_at, delivered_at)) = row else {
         return Ok(QuestionStatus::Missing);
     };
     match answer.as_deref() {
@@ -3971,6 +4080,9 @@ pub(crate) fn pending_question_status(
     }
     if timestamp_to_millis(now) > timestamp_to_millis(from_sql_i64(expires_at)?) {
         return Ok(QuestionStatus::Expired);
+    }
+    if delivered_at.is_some() {
+        return Ok(QuestionStatus::Delivered);
     }
     Ok(QuestionStatus::Open)
 }
@@ -4051,9 +4163,14 @@ pub(crate) fn settle_stale_native_questions(
     keep_question_id: &str,
     now: u64,
 ) -> Result<usize> {
+    // `keep_question_id` is the BATCH KEY to keep: a multi-question call's
+    // batch_id (so its sibling tabs survive), or a single question's own id —
+    // a single row's batch key IS its question_id (batch_id NULL). Rows under
+    // any OTHER key are the stale ones.
     let changed = conn.execute(
         "UPDATE pending_questions SET answer = ?2, answered_at = ?3
-         WHERE thread_id = ?1 AND question_id != ?4 AND answer IS NULL AND native_attach = 1",
+         WHERE thread_id = ?1 AND COALESCE(batch_id, question_id) != ?4
+           AND answer IS NULL AND native_attach = 1",
         params![
             thread_id,
             QUESTION_ANSWERED_ELSEWHERE,
@@ -9294,5 +9411,85 @@ mod tests {
         // An overtaken snapshot's row was left alone; a write that did not
         // happen must not be counted as a synced thread either.
         assert_eq!(sync["synced"], 1, "sync: {sync}");
+    }
+
+    /// A multi-question call's rows share a batch (0.2.16): `question_prompt`
+    /// reads each tab's index and count; a typed digit marks the row
+    /// `Delivered` (not answered); settling a fork's stale native rows keeps
+    /// the CURRENT batch's siblings — only another batch, or an older single,
+    /// is stale; and the hook's authoritative record fills every tab by text.
+    #[test]
+    fn a_question_batch_keeps_its_siblings_and_reads_delivered() {
+        let path = std::env::temp_dir().join(format!("tinyctb-batch-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let conn = create_state_db(&path).expect("db");
+        let opts = vec!["A".to_string(), "B".to_string()];
+        for (id, text, seq) in [("q1", "first?", 0usize), ("q2", "second?", 1usize)] {
+            create_pending_question(&conn, id, "fork", text, &opts, false, 1_000, 900_000)
+                .expect("row");
+            set_question_batch(&conn, id, "call-1", seq, 2).expect("batch");
+            mark_question_native_attach(&conn, id).expect("native");
+        }
+        // An older SINGLE native row of the same fork — stale once the batch opens.
+        create_pending_question(&conn, "q0", "fork", "old?", &opts, false, 500, 900_000)
+            .expect("row");
+        mark_question_native_attach(&conn, "q0").expect("native");
+
+        let p2 = question_prompt(&conn, "q2").expect("read").expect("row");
+        assert_eq!(p2.batch, Some(QuestionBatch { seq: 1, total: 2 }));
+        assert!(p2.native_attach);
+        let p0 = question_prompt(&conn, "q0").expect("read").expect("row");
+        assert_eq!(p0.batch, None, "a single row is not a batch");
+
+        // Settling with the BATCH as the key closes only the old single.
+        let closed = settle_stale_native_questions(&conn, "fork", "call-1", 2_000).expect("settle");
+        assert_eq!(closed, 1);
+        assert_eq!(
+            pending_question_status(&conn, "q0", 2_000).expect("s"),
+            QuestionStatus::Answered
+        );
+        assert_eq!(
+            pending_question_status(&conn, "q1", 2_000).expect("s"),
+            QuestionStatus::Open
+        );
+        assert_eq!(
+            pending_question_status(&conn, "q2", 2_000).expect("s"),
+            QuestionStatus::Open
+        );
+
+        // A typed digit: Delivered, still no answer; idempotent.
+        mark_question_delivered(&conn, "q1", 3_000).expect("delivered");
+        mark_question_delivered(&conn, "q1", 3_500).expect("idempotent");
+        assert_eq!(
+            pending_question_status(&conn, "q1", 3_600).expect("s"),
+            QuestionStatus::Delivered
+        );
+        assert_eq!(
+            question_answer(&conn, "q1").expect("read"),
+            None,
+            "delivered is not answered"
+        );
+
+        // The hook's authoritative record fills BOTH tabs by question text.
+        let touched = record_native_answers_from_hook(
+            &conn,
+            "fork",
+            &[
+                ("first?".to_string(), "A".to_string()),
+                ("second?".to_string(), "B".to_string()),
+            ],
+            4_000,
+        )
+        .expect("record");
+        assert_eq!(touched, 2);
+        assert_eq!(
+            question_answer(&conn, "q1").expect("read").as_deref(),
+            Some("A")
+        );
+        assert_eq!(
+            question_answer(&conn, "q2").expect("read").as_deref(),
+            Some("B")
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

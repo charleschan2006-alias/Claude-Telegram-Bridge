@@ -46,6 +46,11 @@ const TELEGRAM_WINDOWLESS_APPROVAL_HINT: &str =
 /// about durations.
 const TELEGRAM_WINDOWLESS_QUESTION_HINT: &str =
     "💬 这个会话在后台运行、没有终端窗口——终端里看不到这道题，只能在这里作答。";
+/// A tab of a multi-question call the phone cannot drive (multi-select, free
+/// text, or an interactive session's own dialog): no buttons, and replying
+/// here would not answer it either.
+const TELEGRAM_NOTIFY_ONLY_QUESTION_HINT: &str =
+    "🖥️ 这一题手机答不了，请到电脑的对话框里作答（回复本消息不会作为答案）。";
 /// Neither confirmed: the session has no verified live socket, or reading it
 /// failed. "It falls back to the terminal dialog" would be a guess, and the
 /// status line right above may already be saying 💤 idle or ❓ unreadable —
@@ -95,6 +100,11 @@ pub(crate) struct PreparedTelegramDelivery {
     /// Same, for an approval request — used to catch a text reply that was
     /// meant as an answer and tell the user to use the buttons.
     pub(crate) approval_id: Option<String>,
+    /// A question message the phone CANNOT answer (a multi-question tab that
+    /// is multi-select / free text, or an interactive session's own dialog):
+    /// delivery registers no reply route for it, so a reply is never fed into
+    /// the session as a prompt.
+    pub(crate) notify_only: bool,
 }
 
 fn telegram_event_title(event_type: &str, event: &Value) -> &'static str {
@@ -136,6 +146,9 @@ fn telegram_event_reply_hint(event_type: &str, event: &Value) -> &'static str {
                 }
             }
         };
+    }
+    if event.get("notifyOnly").and_then(Value::as_bool) == Some(true) {
+        return TELEGRAM_NOTIFY_ONLY_QUESTION_HINT;
     }
     if telegram_event_is_approval(event) {
         TELEGRAM_APPROVAL_HINT
@@ -491,6 +504,7 @@ pub(crate) fn prepare_telegram_delivery(
             .get("approvalId")
             .and_then(Value::as_str)
             .map(str::to_string),
+        notify_only: event.get("notifyOnly").and_then(Value::as_bool) == Some(true),
     })
 }
 

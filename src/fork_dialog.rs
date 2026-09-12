@@ -388,6 +388,13 @@ pub(crate) enum InjectOutcome {
     /// retry. This is what lets the inject side stop scraping the pty to GUESS the
     /// outcome — the guess (and its unrecoverable false-positive) is gone.
     Delivered,
+    /// (Multi-question, 0.2.16.) This tab's digit went into the dialog, but the
+    /// batch could NOT be confirmed submitted: the tab bar was unreadable
+    /// afterwards, or the walk onto Submit did not land there. The row is
+    /// marked delivered (never retype the digit) but the button stays LIVE — a
+    /// later tap on it, or on any delivered sibling once the whole batch is
+    /// delivered, performs a submit-only recovery (`inject_submit_only`).
+    SubmitPending,
     /// The dialog was never found: the selector chrome did not appear within the
     /// budget (already answered/closed, still connecting, or the attach failed).
     /// NOTHING was typed. The phone reports this as retryable and records nothing;
@@ -405,20 +412,25 @@ pub(crate) enum InjectOutcome {
 /// DB row's status is the identity check), and only then types the option's
 /// number + Enter. With `verify_present` false it always injects — for the
 /// manual command, where the caller vouches the dialog is up.
+/// `multi` names the tab when the dialog is a multi-question one: the injector
+/// navigates there and types the digit only (the dialog moves on by itself);
+/// `None` is the single-question dialog, answered with digit + Enter.
 pub(crate) fn inject_option(
     session_id: &str,
     index: usize,
     verify_present: bool,
+    multi: Option<MultiTab>,
     still_authorized: impl Fn() -> bool,
 ) -> Result<InjectOutcome> {
     let (connect, settle) = default_waits();
-    inject_option_timed(
+    inject_option_timed_multi(
         session_id,
         index,
         verify_present,
         connect,
         SELECTOR_KEY_GAP,
         settle,
+        multi,
         still_authorized,
     )
 }
@@ -434,6 +446,272 @@ pub(crate) fn inject_via_attach(session_id: &str, keystrokes: &[u8]) -> Result<(
     })
 }
 
+/// One tab of a multi-question dialog to answer: the injector navigates to
+/// tab `seq` (0-based, of `total`) before typing. `None` = an ordinary
+/// single-question dialog, which has no tab bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MultiTab {
+    pub(crate) seq: usize,
+    pub(crate) total: usize,
+}
+
+/// What a multi-question dialog's tab bar says on the current screen. The bar
+/// is `← ☐ Color ☐ Size ✔ Submit →` (measured 2026-09-12): `☐` marks an
+/// UNANSWERED tab, `☒` an ANSWERED one, and the tab painted with the highlight
+/// background is the CURRENT one. Parsed from the LAST bar in the frame — a
+/// forced repaint redraws it whole.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TabBar {
+    pub(crate) answered: usize,
+    pub(crate) unanswered: usize,
+    /// The current tab as painted, e.g. `☐ Color`, `☒ Size`, `✔ Submit`.
+    pub(crate) current: Option<String>,
+    /// The current tab's POSITION: how many question tabs (`☐`/`☒`) precede
+    /// the highlighted one — 0-based, and equal to the tab count when the
+    /// Submit tab is current. This is what proves a digit lands on tab `seq`;
+    /// `☐` alone only says "some unanswered tab".
+    pub(crate) current_index: Option<usize>,
+}
+
+const TAB_UNANSWERED: &[u8] = b"\xe2\x98\x90"; // ☐
+const TAB_ANSWERED: &[u8] = b"\xe2\x98\x92"; // ☒
+/// The start of the SGR that paints a background under the current tab —
+/// `ESC [ 48 ;` — whatever colour depth follows (`2;r;g;b` truecolor when
+/// COLORTERM=truecolor, `5;n` in the 256-colour fallback). No other tab
+/// carries a background, so the LAST such SGR in the bar marks the current
+/// tab. Never match a full colour value: it depends on the environment the
+/// attach client happens to run in.
+const TAB_HIGHLIGHT_PREFIX: &[u8] = b"\x1b[48;";
+const TAB_SUBMIT: &[u8] = b"Submit";
+const KEY_LEFT: &[u8] = b"\x1b[D";
+const KEY_RIGHT: &[u8] = b"\x1b[C";
+
+fn rfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).rposition(|w| w == needle)
+}
+
+fn count(hay: &[u8], needle: &[u8]) -> usize {
+    hay.windows(needle.len()).filter(|w| *w == needle).count()
+}
+
+/// Read the tab bar from a captured frame (see [`TabBar`]). `None` when no
+/// tab bar is on screen — a single-question dialog, or nothing painted yet.
+pub(crate) fn tab_bar_state(frame: &[u8]) -> Option<TabBar> {
+    // Anchor on the LAST "Submit" (the Submit tab, or the `Submit answers` item
+    // right under it) and look back over the bar, which sits within a few
+    // hundred bytes before it.
+    let end = rfind(frame, TAB_SUBMIT)? + TAB_SUBMIT.len();
+    // Only THIS bar: it begins with the `←` arrow, so cut there — a capture
+    // that holds several repaints must not have their tabs counted together.
+    let bar_start = rfind(&frame[..end], "\u{2190}".as_bytes()).unwrap_or(end.saturating_sub(600));
+    let seg = &frame[bar_start..end];
+    let answered = count(seg, TAB_ANSWERED);
+    let unanswered = count(seg, TAB_UNANSWERED);
+    if answered + unanswered == 0 {
+        return None;
+    }
+    // The current tab is the one painted with a BACKGROUND colour. Match the
+    // SGR *prefix* `ESC [ 48 ;` — truecolor (`48;2;r;g;b`) or 256-colour
+    // (`48;5;n`) alike. Measured 2026-09-12: the probes (a shell with
+    // COLORTERM=truecolor) saw `48;2;177;185;249`, the daemon's attach (no
+    // COLORTERM) got a 256-colour fallback, and an exact-bytes match found no
+    // highlight at all → every phone tap "not the unanswered tab".
+    let highlight_at = rfind(seg, TAB_HIGHLIGHT_PREFIX);
+    let current = highlight_at.map(|at| {
+        // Skip to the end of the background SGR itself (its `m`), whatever
+        // colour value it carries, then the SGRs that follow it.
+        let sgr_end = seg[at..]
+            .iter()
+            .position(|b| *b == b'm')
+            .map(|p| at + p + 1)
+            .unwrap_or(seg.len());
+        let mut rest = &seg[sgr_end..];
+        // The highlight is followed by more SGR codes (the black foreground)
+        // before the tab's text; skip them.
+        while rest.starts_with(b"\x1b[") {
+            match rest.iter().position(|b| *b == b'm') {
+                Some(p) => rest = &rest[p + 1..],
+                None => break,
+            }
+        }
+        let text_end = rest.iter().position(|b| *b == 0x1b).unwrap_or(rest.len());
+        String::from_utf8_lossy(&rest[..text_end.min(32)])
+            .trim()
+            .to_string()
+    });
+    let current_index =
+        highlight_at.map(|at| count(&seg[..at], TAB_ANSWERED) + count(&seg[..at], TAB_UNANSWERED));
+    Some(TabBar {
+        answered,
+        unanswered,
+        current,
+        current_index,
+    })
+}
+
+/// Repaint and read the tab bar, retrying a few times: right after a key the
+/// dialog may still be redrawing, and an unreadable bar must never be taken
+/// for "nothing left to do".
+fn read_bar(master: RawFd, key_gap: Duration, tries: usize) -> Option<TabBar> {
+    // Accumulate across tries: a slow repaint may straddle two reads, and the
+    // parser takes the LAST bar in the buffer, so keeping earlier bytes can
+    // only help. Each try holds the nudged size (see `force_repaint`) and then
+    // waits long enough for a real `claude attach` to repaint.
+    let mut acc = Vec::new();
+    for _ in 0..tries {
+        force_repaint(master);
+        acc.extend(drain_capture(master, key_gap * 6));
+        if let Some(bar) = tab_bar_state(&acc) {
+            return Some(bar);
+        }
+    }
+    None
+}
+
+/// Every tab is answered: walk `→` onto the Submit tab (it clamps there),
+/// CONFIRM the bar now says Submit is current, then Enter — which returns all
+/// the answers. Enter is never sent blind: if the bar cannot be read, or is not
+/// on Submit (the dialog closed meanwhile), nothing is pressed and the next
+/// tap's opening check submits instead. Always `Delivered` — the digit that
+/// brought us here is already in the dialog.
+fn submit_batch(
+    master: RawFd,
+    session_id: &str,
+    tab: MultiTab,
+    key_gap: Duration,
+    settle_wait: Duration,
+    still_authorized: &dyn Fn() -> bool,
+) -> InjectOutcome {
+    for _ in 0..tab.total {
+        if write_all(master, KEY_RIGHT).is_err() {
+            break;
+        }
+        drain_capture(master, key_gap);
+    }
+    // Bind the Enter to OUR batch: every one of exactly `total` tabs answered,
+    // nothing unanswered, and the highlighted tab is the one PAST the last
+    // question — Submit sits at index `total`. A later all-answered dialog of
+    // another size fails this; one of the same size is caught by the
+    // authorization re-check below (a new batch settles our row first).
+    let on_our_submit = matches!(
+        read_bar(master, key_gap, 3),
+        Some(b)
+            if b.answered == tab.total
+                && b.unanswered == 0
+                && b.current_index == Some(tab.total)
+                && b.current.as_deref().is_some_and(|c| c.contains("Submit"))
+    );
+    if !on_our_submit {
+        ilog(format!(
+            "inject {}: all tabs answered but the bar is not our Submit -> Enter withheld -> SubmitPending",
+            short_id(session_id),
+        ));
+        return InjectOutcome::SubmitPending;
+    }
+    if !still_authorized() {
+        ilog(format!(
+            "inject {}: revoked right before submit -> Enter withheld -> SubmitPending",
+            short_id(session_id),
+        ));
+        return InjectOutcome::SubmitPending;
+    }
+    match write_all(master, b"\r") {
+        Ok(()) => {
+            ilog(format!(
+                "inject {}: all {} tabs answered -> submitted -> Delivered",
+                short_id(session_id),
+                tab.total,
+            ));
+            drain_capture(master, settle_wait);
+            InjectOutcome::Delivered
+        }
+        Err(err) => {
+            ilog(format!(
+                "inject {}: submit enter failed ({err}) -> SubmitPending",
+                short_id(session_id),
+            ));
+            InjectOutcome::SubmitPending
+        }
+    }
+}
+
+/// Move a multi-question dialog to tab `seq`: `←`×total first (the bar CLAMPS
+/// at the first tab — measured, no wrap — so this is a deterministic reset
+/// whatever tab the fork or a person at the keyboard left it on), then
+/// `→`×seq. Returns the bar as repainted after the move, so the caller can
+/// verify it landed on an UNANSWERED tab before typing anything.
+fn navigate_to_tab(master: RawFd, tab: MultiTab, key_gap: Duration) -> Result<Option<TabBar>> {
+    // Keep every byte the arrows produce too: each arrow redraws the bar with
+    // the highlight moved, and the parser reads the LAST bar, so the buffer
+    // reflects where the highlight ended up even if the final repaint is slow.
+    let mut acc = Vec::new();
+    for _ in 0..tab.total {
+        write_all(master, KEY_LEFT)?;
+        acc.extend(drain_capture(master, key_gap));
+    }
+    for _ in 0..tab.seq {
+        write_all(master, KEY_RIGHT)?;
+        acc.extend(drain_capture(master, key_gap));
+    }
+    force_repaint(master);
+    acc.extend(drain_capture(master, key_gap * 6));
+    Ok(tab_bar_state(&acc))
+}
+
+/// Submit-only recovery for a multi-question dialog whose tabs are ALL already
+/// answered — each digit delivered, or finished at the keyboard — but whose
+/// batch was never confirmed submitted (`SubmitPending`): attach, and if the
+/// bar shows exactly `total` tabs all answered, walk onto Submit and press
+/// Enter (`submit_batch`, which binds and re-authorizes on its own). NOTHING is
+/// ever retyped. `Unreachable` (retryable) when the dialog is not up, is not an
+/// all-answered `total`-tab bar, or the bar cannot be read.
+pub(crate) fn inject_submit_only(
+    session_id: &str,
+    total: usize,
+    still_authorized: impl Fn() -> bool,
+) -> Result<InjectOutcome> {
+    let (connect, settle) = default_waits();
+    with_attach_pty(session_id, |master| {
+        let (intro, present) = wait_for_chrome(master, connect, true);
+        if !present {
+            ilog(format!(
+                "submit-only {}: intro {}B no dialog -> Unreachable",
+                short_id(session_id),
+                intro.len(),
+            ));
+            return Ok(InjectOutcome::Unreachable);
+        }
+        if !still_authorized() {
+            ilog(format!(
+                "submit-only {}: not authorized -> Unreachable",
+                short_id(session_id),
+            ));
+            return Ok(InjectOutcome::Unreachable);
+        }
+        let all_answered = matches!(
+            read_bar(master, SELECTOR_KEY_GAP, 3),
+            Some(b) if b.answered == total && b.unanswered == 0
+        );
+        if !all_answered {
+            ilog(format!(
+                "submit-only {}: not an all-answered {total}-tab bar -> Unreachable",
+                short_id(session_id),
+            ));
+            return Ok(InjectOutcome::Unreachable);
+        }
+        Ok(submit_batch(
+            master,
+            session_id,
+            MultiTab { seq: 0, total },
+            SELECTOR_KEY_GAP,
+            settle,
+            &still_authorized,
+        ))
+    })
+}
+
+/// Test convenience: the single-question form of [`inject_option_timed_multi`].
+#[cfg(test)]
 pub(crate) fn inject_option_timed(
     session_id: &str,
     index: usize,
@@ -441,6 +719,29 @@ pub(crate) fn inject_option_timed(
     connect_wait: Duration,
     key_gap: Duration,
     settle_wait: Duration,
+    still_authorized: impl Fn() -> bool,
+) -> Result<InjectOutcome> {
+    inject_option_timed_multi(
+        session_id,
+        index,
+        verify_present,
+        connect_wait,
+        key_gap,
+        settle_wait,
+        None,
+        still_authorized,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn inject_option_timed_multi(
+    session_id: &str,
+    index: usize,
+    verify_present: bool,
+    connect_wait: Duration,
+    key_gap: Duration,
+    settle_wait: Duration,
+    multi: Option<MultiTab>,
     still_authorized: impl Fn() -> bool,
 ) -> Result<InjectOutcome> {
     with_attach_pty(session_id, |master| {
@@ -463,7 +764,10 @@ pub(crate) fn inject_option_timed(
         // fresh forkpty, so accumulating cannot be fooled by history. No chrome
         // within the budget ⇒ no live dialog ⇒ Unreachable (retryable, nothing
         // typed).
-        let (intro, present) = wait_for_chrome(master, connect_wait);
+        // A multi-question dialog may be parked on its Submit tab (no selector
+        // hint): count that as present ONLY when we will verify the tab bar
+        // before typing, i.e. for a batch tab. The single path never does.
+        let (intro, present) = wait_for_chrome(master, connect_wait, multi.is_some());
         if !present {
             ilog(format!(
                 "inject {}: intro {}B no chrome -> Unreachable",
@@ -498,6 +802,132 @@ pub(crate) fn inject_option_timed(
                 short_id(session_id),
             ));
             return Ok(InjectOutcome::Unreachable);
+        }
+        if let Some(tab) = multi {
+            // ---- a tab of a multi-question dialog (0.2.16) ----------------
+            // First look at the bar as it is. If EVERY tab is already answered
+            // — a person finished at the keyboard, or an earlier auto-submit
+            // could not read the bar — the dialog is parked on Submit with
+            // nothing left to type: just submit it.
+            if let Some(bar) = read_bar(master, key_gap, 3) {
+                if bar.unanswered == 0 && bar.answered == tab.total {
+                    ilog(format!(
+                        "inject {}: all {} tabs already answered -> submitting",
+                        short_id(session_id),
+                        tab.total,
+                    ));
+                    return Ok(submit_batch(
+                        master,
+                        session_id,
+                        tab,
+                        key_gap,
+                        settle_wait,
+                        &still_authorized,
+                    ));
+                }
+            }
+            // Navigate to OUR tab and read the bar back. It must be an N-tab
+            // bar (ours); the highlighted tab must sit at POSITION `seq` (the
+            // marker count before the highlight — `☐` alone would accept ANY
+            // unanswered tab, so a person moving tabs at the keyboard during
+            // our navigation could otherwise put the digit on the wrong one);
+            // and that tab must still be UNANSWERED (`☐`) — answered at the
+            // keyboard (`☒`), our digit would land on the next tab and answer
+            // the WRONG question. Anything else: nothing typed, Unreachable
+            // (retryable; the hook records what the fork actually took).
+            let bar = navigate_to_tab(master, tab, key_gap)?;
+            let on_our_unanswered_tab = matches!(
+                &bar,
+                Some(bar)
+                    if bar.answered + bar.unanswered == tab.total
+                        && bar.current_index == Some(tab.seq)
+                        && bar.current.as_deref().is_some_and(|c| c.starts_with('☐'))
+            );
+            if !on_our_unanswered_tab {
+                ilog(format!(
+                    "inject {}: tab {}/{} is not the unanswered tab on screen ({bar:?}) -> Unreachable",
+                    short_id(session_id),
+                    tab.seq + 1,
+                    tab.total,
+                ));
+                return Ok(InjectOutcome::Unreachable);
+            }
+            // The navigation took time: the fork may have moved on to a NEW
+            // batch meanwhile (the gate settles our row when it opens one).
+            // Re-check right before the digit, exactly as the single path does
+            // after its wait — the row's status is the question identity.
+            if !still_authorized() {
+                ilog(format!(
+                    "inject {}: question revoked during navigation -> Unreachable",
+                    short_id(session_id),
+                ));
+                return Ok(InjectOutcome::Unreachable);
+            }
+            // FINAL look, right before the digit: the position snapshot above
+            // was followed by a database read, and a person at the keyboard can
+            // move tabs in that gap. Re-read the bar now and require the same
+            // position + `☐`; what remains is the repaint-read → digit gap, the
+            // same microsecond window the single-question path accepts.
+            let final_bar = read_bar(master, key_gap, 2);
+            let still_on_our_tab = matches!(
+                &final_bar,
+                Some(bar)
+                    if bar.answered + bar.unanswered == tab.total
+                        && bar.current_index == Some(tab.seq)
+                        && bar.current.as_deref().is_some_and(|c| c.starts_with('☐'))
+            );
+            if !still_on_our_tab {
+                ilog(format!(
+                    "inject {}: tab {}/{} moved during the authorization check ({final_bar:?}) -> Unreachable",
+                    short_id(session_id),
+                    tab.seq + 1,
+                    tab.total,
+                ));
+                return Ok(InjectOutcome::Unreachable);
+            }
+            // The digit selects THIS tab's option and the dialog moves on by
+            // itself — NO Enter here (Enter on a tab picks its highlighted
+            // default, measured 2026-09-12).
+            write_all(master, &option_digits(index))?;
+            drain_capture(master, key_gap);
+            // Was that the last unanswered tab? Then submit — `submit_batch`
+            // walks onto Submit and CONFIRMS it before pressing Enter. An
+            // unreadable bar here defers the submit to the next tap's opening
+            // check rather than pressing anything blind.
+            return Ok(match read_bar(master, key_gap, 3) {
+                // Last tab answered: submit (bound + re-authorized inside).
+                Some(b) if b.unanswered == 0 => submit_batch(
+                    master,
+                    session_id,
+                    tab,
+                    key_gap,
+                    settle_wait,
+                    &still_authorized,
+                ),
+                Some(_) => {
+                    ilog(format!(
+                        "inject {}: tab {}/{} typed -> Delivered",
+                        short_id(session_id),
+                        tab.seq + 1,
+                        tab.total,
+                    ));
+                    drain_capture(master, settle_wait);
+                    InjectOutcome::Delivered
+                }
+                // Unreadable: we cannot tell whether that was the last tab, so
+                // the submit may be owed. Say so (the button stays live) rather
+                // than pressing anything blind.
+                None => {
+                    ilog(format!(
+                        "inject {}: tab {}/{} typed; bar unreadable afterwards -> SubmitPending",
+                        short_id(session_id),
+                        tab.seq + 1,
+                        tab.total,
+                    ));
+                    drain_capture(master, settle_wait);
+                    InjectOutcome::SubmitPending
+                }
+            });
         }
         // Committed: type the number, a beat (`key_gap`, so the selector buffers
         // the digit before Enter reads it — Enter on an empty buffer submits the
@@ -543,6 +973,22 @@ fn dialog_present(screen: &[u8]) -> bool {
         .windows(SELECTOR_CHROME.len())
         .any(|window| window == SELECTOR_CHROME)
 }
+
+/// A multi-question dialog parked on its Submit tab no longer shows the
+/// selector hint (measured 2026-09-12: only `1. Submit answers`). It is still
+/// a LIVE dialog for the paths that VERIFY the tab bar before typing (the
+/// multi-tab injector and submit-only recovery) — and ONLY for them: the
+/// single-question path types digit + Enter on presence alone, so for it this
+/// plain text (which can also appear in transcript echo) must never count.
+fn submit_tab_present(screen: &[u8]) -> bool {
+    screen
+        .windows(SUBMIT_CHROME.len())
+        .any(|window| window == SUBMIT_CHROME)
+}
+
+/// The Submit tab's own item text — the live-dialog signature when every tab
+/// is answered and the selector hint is gone.
+const SUBMIT_CHROME: &[u8] = b"Submit answers";
 
 /// Run `claude attach <id>` on a pty and hand the master fd to `drive`,
 /// then always reap the child and close the fd.
@@ -595,6 +1041,19 @@ fn with_attach_pty<T>(session_id: &str, drive: impl FnOnce(RawFd) -> Result<T>) 
     if !has_term {
         env_cstrings
             .push(std::ffi::CString::new("TERM=xterm-256color").expect("literal has no NUL"));
+    }
+    // COLORTERM too: without it the TUI falls back to 256 colours and paints
+    // the multi-question tab bar's highlight as `48;5;n` instead of the
+    // truecolor `48;2;r;g;b` the probes saw (the daemon's systemd environment
+    // has neither TERM nor COLORTERM; measured 2026-09-12). The bar parser
+    // now accepts either, but rendering exactly what the probes captured is
+    // the safer of the two.
+    if !env_cstrings
+        .iter()
+        .any(|c| c.as_bytes().starts_with(b"COLORTERM="))
+    {
+        env_cstrings
+            .push(std::ffi::CString::new("COLORTERM=truecolor").expect("literal has no NUL"));
     }
     let mut envp: Vec<*const libc::c_char> = env_cstrings.iter().map(|c| c.as_ptr()).collect();
     envp.push(std::ptr::null());
@@ -768,6 +1227,16 @@ fn force_repaint(master: RawFd) {
     };
     unsafe {
         libc::ioctl(master, libc::TIOCSWINSZ, &nudged);
+    }
+    // HOLD the nudged size. The TUI handles SIGWINCH asynchronously and reads
+    // the CURRENT size when it gets to it: two back-to-back ioctls left it
+    // seeing 200 → 200 — "no change" — and it never repainted. Measured on
+    // the real machine 2026-09-12: every tab-bar read after navigation came
+    // back empty (→ Unreachable on every phone tap), while the probes that
+    // worked slept 150 ms between the two sizes. A stub that reprints on its
+    // own cannot show this, so it is documented here, not just tested.
+    std::thread::sleep(Duration::from_millis(150));
+    unsafe {
         libc::ioctl(master, libc::TIOCSWINSZ, &normal);
     }
 }
@@ -782,7 +1251,11 @@ fn force_repaint(master: RawFd) {
 /// never slows the success path — it only bounds the wait for a dialog that will
 /// never show. A read of 0 (EOF: attach exited) ends the wait early with
 /// whatever was seen; EINTR is retried, not mistaken for EOF.
-fn wait_for_chrome(master: RawFd, budget: Duration) -> (Vec<u8>, bool) {
+fn wait_for_chrome(master: RawFd, budget: Duration, also_submit_tab: bool) -> (Vec<u8>, bool) {
+    // `also_submit_tab`: the tab-bar-verifying paths also accept a dialog
+    // parked on its Submit tab (see `submit_tab_present`); the single-question
+    // path must not, since it types on presence alone.
+    let hit = |acc: &[u8]| dialog_present(acc) || (also_submit_tab && submit_tab_present(acc));
     let deadline = Instant::now() + budget;
     let mut acc = Vec::new();
     let mut buf = [0u8; 8192];
@@ -806,12 +1279,12 @@ fn wait_for_chrome(master: RawFd, budget: Duration) -> (Vec<u8>, bool) {
                 break; // EOF: the attach client exited.
             }
             acc.extend_from_slice(&buf[..n as usize]);
-            if dialog_present(&acc) {
+            if hit(&acc) {
                 return (acc, true);
             }
         }
     }
-    let present = dialog_present(&acc);
+    let present = hit(&acc);
     (acc, present)
 }
 
@@ -967,6 +1440,312 @@ mod tests {
         // scrollback, so matching it could not tell a live dialog from history.
         let gone = b"\x1b[2m APPLE  \xe9\xa6\x99\xe8\x95\x89  (the session moved on)\x1b[0m";
         assert!(!dialog_present(gone));
+        // A multi-question dialog parked on Submit shows no selector hint, only
+        // its Submit item. That is a live dialog ONLY for the tab-bar-verifying
+        // paths; the single-question path (digit + Enter on presence alone)
+        // must NOT see it as one — the same text can echo in a transcript.
+        let parked = b"\x1b[38;2;177;185;249m\xe2\x9d\xaf\x1b[39m 1. Submit answers\x1b[K";
+        assert!(!dialog_present(parked));
+        assert!(submit_tab_present(parked));
+    }
+
+    /// The tab bar is read from REAL frames captured on-machine 2026-09-12
+    /// (`claude attach` on a 2-question fork): the bar before anything was
+    /// answered, and the bar after both tabs were answered with the Submit tab
+    /// current.
+    #[test]
+    fn the_tab_bar_reads_answered_unanswered_and_current_from_real_frames() {
+        // First render: `← [☐ Color] ☐ Size ✔ Submit →`, Color highlighted.
+        let fresh = b"\r\x1b[1B\xe2\x86\x90 \x1b[48;2;177;185;249m\x1b[38;2;0;0;0m \xe2\x98\x90 Color \x1b[13G\x1b[39m\x1b[49m\xe2\x98\x90\x1b[15GSize\x1b[21G\xe2\x9c\x94\x1b[23GSubmit\x1b[31G\xe2\x86\x92\r\x1b[2B\x1b[38;2;255;255;255m\x1b[1mMQ1:";
+        assert_eq!(
+            tab_bar_state(fresh),
+            Some(TabBar {
+                answered: 0,
+                unanswered: 2,
+                current: Some("☐ Color".to_string()),
+                current_index: Some(0),
+            })
+        );
+        // After two digits: `← ☒ Color ☒ Size [✔ Submit] →`, Submit highlighted.
+        let done = b"\r\x1b[1B\x1b[39m\xe2\x86\x90\x1b[4G\xe2\x98\x92\x1b[6GColor\x1b[13G\xe2\x98\x92\x1b[15GSize\x1b[20G\x1b[48;2;177;185;249m\x1b[38;2;0;0;0m \xe2\x9c\x94 Submit \x1b[49m\x1b[38;2;153;153;153m \xe2\x86\x92\r\x1b[1B";
+        assert_eq!(
+            tab_bar_state(done),
+            Some(TabBar {
+                answered: 2,
+                unanswered: 0,
+                current: Some("✔ Submit".to_string()),
+                current_index: Some(2),
+            })
+        );
+        // The 256-colour fallback (no COLORTERM, as under the daemon): the
+        // highlight is `48;5;n`, and must be read the same way — measured
+        // 2026-09-12 when every phone tap found "no current tab".
+        let fallback = b"\xe2\x86\x90 \x1b[48;5;147m\x1b[38;5;16m \xe2\x98\x90 Color \x1b[49m\x1b[39m\xe2\x98\x90 Size \xe2\x9c\x94 Submit \xe2\x86\x92";
+        assert_eq!(
+            tab_bar_state(fallback),
+            Some(TabBar {
+                answered: 0,
+                unanswered: 2,
+                current: Some("☐ Color".to_string()),
+                current_index: Some(0),
+            })
+        );
+        // A single-question dialog has no tab bar at all.
+        assert_eq!(tab_bar_state(b"\x1b[2m Enter to select \x1b[0m"), None);
+    }
+
+    /// The stub's `head -c N` writes the captured keys only once it has N
+    /// bytes OR the pty closes — which happens asynchronously after the
+    /// injector returns. Wait (briefly) for the file to reach `want` bytes.
+    fn read_keys(capture: &std::path::Path, want: usize) -> Vec<u8> {
+        for _ in 0..100 {
+            let keys = std::fs::read(capture).unwrap_or_default();
+            if keys.len() >= want {
+                return keys;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::read(capture).unwrap_or_default()
+    }
+
+    /// A tab-bar frame for the stubs below: the selector chrome plus a
+    /// 2-tab bar whose CURRENT tab is `current` (painted with the highlight).
+    fn two_tab_frame(current: &str) -> String {
+        format!(
+            "Enter to select \u{2190} \u{2610} Color \x1b[48;2;177;185;249m\x1b[38;2;0;0;0m {current} \x1b[49m\x1b[39m\u{2714} Submit \u{2192}"
+        )
+    }
+
+    /// A tab of a multi-question dialog: the injector RESETS to the first tab
+    /// (`←`×total — the bar clamps there), walks `→`×seq to ours, sees it is
+    /// still unanswered (`☐`), and types the digit ONLY — no Enter, the dialog
+    /// moves on by itself. Here the (static) bar still shows unanswered tabs
+    /// afterwards, so nothing is submitted.
+    #[test]
+    fn a_multi_question_tab_is_navigated_to_and_gets_only_the_digit() {
+        let _guard = crate::state::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("tinyctb-multitab-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let capture = dir.join("keys.bin");
+        let frame = two_tab_frame("\u{2610} Size");
+        let stub = live_attach_stub(&dir, &frame, &frame, &capture, 10);
+        std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
+        let outcome = inject_option_timed_multi(
+            "sess-x",
+            1,
+            true,
+            Duration::from_millis(400),
+            Duration::from_millis(120),
+            Duration::from_millis(120),
+            Some(MultiTab { seq: 1, total: 2 }),
+            || true,
+        )
+        .expect("inject");
+        std::env::remove_var("TINYCTB_TEST_ATTACH");
+        assert_eq!(outcome, InjectOutcome::Delivered);
+        // ← ← (reset, clamps) → (to tab 1) then the digit for option index 1.
+        assert_eq!(read_keys(&capture, 10), b"\x1b[D\x1b[D\x1b[C2".to_vec());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same tab, but a person at the keyboard ALREADY answered it (the
+    /// bar paints it `☒`): typing our digit would land on the NEXT tab and
+    /// answer the wrong question, so only the navigation keys are sent, no
+    /// digit, and the outcome is `Unreachable` (retryable; the hook records
+    /// what the fork actually took).
+    #[test]
+    fn an_already_answered_tab_gets_no_digit() {
+        let _guard = crate::state::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("tinyctb-tabdone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let capture = dir.join("keys.bin");
+        let frame = two_tab_frame("\u{2612} Size");
+        // Exactly the 9 navigation bytes are expected; the stub's `head -c`
+        // only writes its capture once it has that many (a 10th byte — the
+        // digit — must never come, which the code guarantees structurally by
+        // returning before the digit write).
+        let stub = live_attach_stub(&dir, &frame, &frame, &capture, 9);
+        std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
+        let outcome = inject_option_timed_multi(
+            "sess-x",
+            1,
+            true,
+            Duration::from_millis(400),
+            Duration::from_millis(120),
+            Duration::from_millis(120),
+            Some(MultiTab { seq: 1, total: 2 }),
+            || true,
+        )
+        .expect("inject");
+        std::env::remove_var("TINYCTB_TEST_ATTACH");
+        assert_eq!(outcome, InjectOutcome::Unreachable);
+        assert_eq!(
+            read_keys(&capture, 9),
+            b"\x1b[D\x1b[D\x1b[C".to_vec(),
+            "navigation only — never the digit"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bar's highlighted tab is unanswered (`☐`) but sits at the WRONG
+    /// position — someone at the keyboard moved the tabs during our
+    /// navigation. `☐` alone would accept it; the position check must not:
+    /// navigation only, no digit, `Unreachable`.
+    #[test]
+    fn a_tab_at_the_wrong_position_gets_no_digit() {
+        let _guard = crate::state::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("tinyctb-tabpos-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let capture = dir.join("keys.bin");
+        // Highlight on tab 0 (`☐ Color`) while we are answering tab 1.
+        let frame = "Enter to select \u{2190} \x1b[48;2;177;185;249m\x1b[38;2;0;0;0m \u{2610} Color \x1b[49m\x1b[39m \u{2610} Size \u{2714} Submit \u{2192}";
+        let stub = live_attach_stub(&dir, frame, frame, &capture, 9);
+        std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
+        let outcome = inject_option_timed_multi(
+            "sess-x",
+            1,
+            true,
+            Duration::from_millis(400),
+            Duration::from_millis(120),
+            Duration::from_millis(120),
+            Some(MultiTab { seq: 1, total: 2 }),
+            || true,
+        )
+        .expect("inject");
+        std::env::remove_var("TINYCTB_TEST_ATTACH");
+        assert_eq!(outcome, InjectOutcome::Unreachable);
+        assert_eq!(
+            read_keys(&capture, 9),
+            b"\x1b[D\x1b[D\x1b[C".to_vec(),
+            "wrong position: navigation only, never the digit"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every tab is already answered and the dialog is parked on Submit (a
+    /// person finished at the keyboard, or an earlier auto-submit could not
+    /// read the bar): a tap on any tab submits instead of navigating — `→`
+    /// onto Submit, the bar CONFIRMS Submit is current, then Enter. Nothing
+    /// else is typed.
+    #[test]
+    fn a_fully_answered_dialog_is_submitted_on_the_next_tap() {
+        let _guard = crate::state::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("tinyctb-tabsubmit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let capture = dir.join("keys.bin");
+        let frame = "Enter to select \u{2190} \u{2612} Color \u{2612} Size \x1b[48;2;177;185;249m\x1b[38;2;0;0;0m \u{2714} Submit \x1b[49m\x1b[39m \u{2192}";
+        // `→`×2 (onto Submit) then Enter: 7 bytes, and the stub writes only
+        // once it has them all.
+        let stub = live_attach_stub(&dir, frame, frame, &capture, 7);
+        std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
+        let outcome = inject_option_timed_multi(
+            "sess-x",
+            0,
+            true,
+            Duration::from_millis(400),
+            Duration::from_millis(120),
+            Duration::from_millis(120),
+            Some(MultiTab { seq: 0, total: 2 }),
+            || true,
+        )
+        .expect("inject");
+        std::env::remove_var("TINYCTB_TEST_ATTACH");
+        assert_eq!(outcome, InjectOutcome::Delivered);
+        assert_eq!(
+            read_keys(&capture, 7),
+            b"\x1b[C\x1b[C\r".to_vec(),
+            "walk onto Submit, confirm, Enter — no digit"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Submit-only recovery (a tap on a delivered tab of a batch parked on
+    /// Submit — its footer no longer shows the selector hint, only the Submit
+    /// item): the bar shows all `total` tabs answered, so the injector walks
+    /// onto Submit and presses Enter. Nothing else is typed.
+    #[test]
+    fn submit_only_recovery_presses_enter_on_a_fully_answered_dialog() {
+        let _guard = crate::state::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("tinyctb-subonly-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let capture = dir.join("keys.bin");
+        // Parked on Submit: no "Enter to select", but "1. Submit answers".
+        let frame = "\u{2190} \u{2612} Color \u{2612} Size \x1b[48;2;177;185;249m\x1b[38;2;0;0;0m \u{2714} Submit \x1b[49m\x1b[39m \u{2192}\n\u{276f} 1. Submit answers";
+        let stub = live_attach_stub(&dir, frame, frame, &capture, 7);
+        std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
+        let outcome = inject_submit_only("sess-x", 2, || true).expect("submit-only");
+        std::env::remove_var("TINYCTB_TEST_ATTACH");
+        assert_eq!(outcome, InjectOutcome::Delivered);
+        assert_eq!(read_keys(&capture, 7), b"\x1b[C\x1b[C\r".to_vec());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bar is all-answered but is NOT ours — three tabs where our batch
+    /// has two: neither the submit-only recovery nor `submit_batch` may press
+    /// Enter on it. Nothing is typed at all.
+    #[test]
+    fn submit_is_withheld_for_a_dialog_that_is_not_ours() {
+        let _guard = crate::state::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("tinyctb-notours-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let capture = dir.join("keys.bin");
+        let frame = "\u{2190} \u{2612} A \u{2612} B \u{2612} C \x1b[48;2;177;185;249m\x1b[38;2;0;0;0m \u{2714} Submit \x1b[49m\x1b[39m \u{2192}\n\u{276f} 1. Submit answers";
+        let stub = live_attach_stub(&dir, frame, frame, &capture, 1);
+        std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
+        let outcome = inject_submit_only("sess-x", 2, || true).expect("submit-only");
+        std::env::remove_var("TINYCTB_TEST_ATTACH");
+        assert_eq!(outcome, InjectOutcome::Unreachable);
+        assert!(
+            read_keys(&capture, 1).is_empty(),
+            "a three-tab dialog is not our two-tab batch: nothing typed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `submit_batch`'s OWN final authorization check: the bar is a valid,
+    /// same-sized, all-answered Submit bar (so every structural check passes),
+    /// but authorization is revoked right before Enter — the second call to
+    /// the closure, after `inject_submit_only`'s first. The walk onto Submit
+    /// happens, Enter does not, and the outcome is `SubmitPending`.
+    ///
+    /// The stub's `head -c N` writes its capture only once it has N bytes, so
+    /// ONE run cannot prove both halves. Two runs do: with N = 6 the capture
+    /// is exactly the two arrows (the walk happened); with N = 7 a seventh
+    /// byte — Enter — would COMPLETE the capture, so an EMPTY capture proves
+    /// no Enter was ever sent.
+    #[test]
+    fn a_revoked_batch_gets_no_enter_even_on_its_own_submit_tab() {
+        let _guard = crate::state::test_env_lock();
+        let frame = "\u{2190} \u{2612} Color \u{2612} Size \x1b[48;2;177;185;249m\x1b[38;2;0;0;0m \u{2714} Submit \x1b[49m\x1b[39m \u{2192}\n\u{276f} 1. Submit answers";
+        let run = |tag: &str, keys: usize| {
+            let dir =
+                std::env::temp_dir().join(format!("tinyctb-revoked-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("dir");
+            let capture = dir.join("keys.bin");
+            let stub = live_attach_stub(&dir, frame, frame, &capture, keys);
+            std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
+            let calls = std::cell::Cell::new(0u32);
+            let authorized_once = || {
+                calls.set(calls.get() + 1);
+                calls.get() == 1
+            };
+            let outcome = inject_submit_only("sess-x", 2, authorized_once).expect("submit-only");
+            std::env::remove_var("TINYCTB_TEST_ATTACH");
+            let bytes = read_keys(&capture, keys);
+            std::fs::remove_dir_all(&dir).ok();
+            (outcome, calls.get(), bytes)
+        };
+        // Run 1 — N = 6: the walk onto Submit is exactly two right arrows.
+        let (outcome, calls, bytes) = run("walk", 6);
+        assert_eq!(outcome, InjectOutcome::SubmitPending);
+        assert_eq!(calls, 2, "checked once on entry, once right before Enter");
+        assert_eq!(bytes, b"\x1b[C\x1b[C".to_vec(), "walked onto Submit");
+        // Run 2 — N = 7: a seventh byte (Enter) would complete the capture;
+        // an empty capture proves Enter was withheld after the revocation.
+        let (outcome, calls, bytes) = run("noenter", 7);
+        assert_eq!(outcome, InjectOutcome::SubmitPending);
+        assert_eq!(calls, 2);
+        assert!(bytes.is_empty(), "a 7th byte (Enter) was sent: {bytes:?}");
     }
 
     /// A stub `claude attach` that keeps a background printer redrawing `prints`

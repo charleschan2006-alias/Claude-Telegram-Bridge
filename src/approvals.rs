@@ -1155,15 +1155,33 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     if thread_id.is_empty() {
         return Ok(no_opinion());
     }
-    // Several questions in one call would need several round trips; that is
-    // not worth the complexity here, so leave those to the terminal dialog.
     let questions = payload
         .pointer("/tool_input/questions")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if questions.len() != 1 {
+    if questions.is_empty() {
         return Ok(no_opinion());
+    }
+    // SEVERAL questions in one call (0.2.16). The native dialog is ONE box with
+    // a tab bar, one tab per question: a digit on a tab selects it and the
+    // dialog moves on, and Enter on the final Submit tab returns ALL the
+    // answers at once. This gate used to hand such calls to the terminal
+    // silently — no row, no push, not even the attach window — which for a
+    // remote user and a background fork was a silent stall (measured
+    // 2026-09-12: two such calls, two tabs each, never reached the phone).
+    // Now EVERY question is pushed, one message per tab; see
+    // `release_question_batch`.
+    if questions.len() > 1 {
+        return release_question_batch(
+            &payload,
+            &questions,
+            &thread_id,
+            &telegram.chat_id,
+            windowless,
+            session_window,
+            now,
+        );
     }
     // The answers map is keyed by the question text EXACTLY as the tool sent
     // it; a trimmed key would not match and the tool would still consider the
@@ -1362,6 +1380,155 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     }
 }
 
+/// The multi-question release (0.2.16): one push per tab of the fork's tabbed
+/// dialog, then `no_opinion` so that dialog renders. On a background fork
+/// every single-select tab is INJECTABLE — it gets a native row (sharing the
+/// call's `batch_id`, with its tab index) and answer buttons, and the phone
+/// may answer the tabs in ANY order: the injector navigates to the tab first
+/// (`fork_dialog::inject_option_multi`). A tab the injector cannot drive —
+/// multi-select needs space toggles, free text has no option number — gets a
+/// notify-only message saying to answer that one at the PC; on an interactive
+/// session every tab is notify-only (its own terminal shows the dialog).
+/// Never silent: the user's law is that every question reaches the phone.
+/// Rows are created only for injectable tabs, so nothing offers a button that
+/// no hook is waiting on.
+#[allow(clippy::too_many_arguments)]
+fn release_question_batch(
+    payload: &Value,
+    questions: &[Value],
+    thread_id: &str,
+    chat_id: &str,
+    windowless: bool,
+    session_window: crate::claude::SessionWindow,
+    now: u64,
+) -> Result<Value> {
+    let total = questions.len();
+    let batch_id = match payload.get("tool_use_id").and_then(Value::as_str) {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => format!("batch-{}", generate_session_uuid()?),
+    };
+    // The long window, as for any released question: no terminal dialog
+    // expires the phone's buttons; the batch submit is what settles them.
+    let wait = WINDOWLESS_APPROVAL_WAIT;
+    let conn = create_state_db(&state_db_path()?)?;
+    let cwd = payload.get("cwd").and_then(Value::as_str);
+    let banner = QuestionBanner::for_session(windowless);
+    let mut events = Vec::with_capacity(total);
+    {
+        let tx = conn.unchecked_transaction()?;
+        for (seq, question) in questions.iter().enumerate() {
+            let question_text = question
+                .get("question")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if question_text.is_empty() {
+                continue;
+            }
+            let multi_select = question
+                .get("multiSelect")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let options = question
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(|option| option.get("label").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            // Injectable: a tab the daemon can answer by typing its number.
+            let injectable = windowless && !multi_select && !options.is_empty();
+            let (question_id, buttons) = if injectable {
+                let question_id = format!("q{}", generate_session_uuid()?.replace('-', ""));
+                crate::state::create_pending_question(
+                    &tx,
+                    &question_id,
+                    thread_id,
+                    &question_text,
+                    &options,
+                    multi_select,
+                    now,
+                    now + wait.as_millis() as u64,
+                )?;
+                crate::state::set_question_batch(&tx, &question_id, &batch_id, seq, total)?;
+                crate::state::mark_question_native_attach(&tx, &question_id)?;
+                let buttons =
+                    question_answer_buttons(&tx, chat_id, thread_id, &question_id, &options, now)?;
+                (Some(question_id), buttons)
+            } else {
+                (None, Vec::new())
+            };
+            let label = format!("【第 {}/{} 问】", seq + 1, total);
+            let body = if injectable {
+                format!("{label}{}", question_body(&question_text, &options, false))
+            } else if windowless {
+                let kind = if multi_select {
+                    "多选题"
+                } else {
+                    "自由文本题"
+                };
+                format!(
+                    "{label}{question_text}\n\n（这是{kind}，手机按钮驱动不了，请在电脑的对话框里答这一题）"
+                )
+            } else {
+                format!("{label}{question_text}\n\n（多题对话框，请在终端里作答）")
+            };
+            banner.paint_question(&question_text, &options, multi_select);
+            let mut event = json!({
+                "type": "question_request",
+                "threadId": thread_id,
+                "observedAt": now,
+                "eventKey": match &question_id {
+                    Some(id) => format!("question:{id}"),
+                    None => format!("question:{batch_id}:{seq}"),
+                },
+                "lastPreview": body,
+                "buttons": buttons,
+                "terminalVisibility": terminal_visibility(session_window),
+                "thread": {
+                    "threadId": thread_id,
+                    "cwd": cwd,
+                    "project": crate::projects::derive_project_label(cwd),
+                    "lastPreview": body
+                }
+            });
+            if let Some(id) = &question_id {
+                event["questionId"] = json!(id);
+            } else {
+                // Notify-only: the renderer must not promise phone answering,
+                // and a reply must not be routed into the session as a prompt.
+                event["notifyOnly"] = json!(true);
+            }
+            events.push(event);
+        }
+        if windowless {
+            // This batch is the fork's current question set; any OLDER open
+            // native rows — a previous batch, or a single — are stale. Same
+            // invariant as the single-question release, keyed by batch so the
+            // siblings just created survive.
+            crate::state::settle_stale_native_questions(&tx, thread_id, &batch_id, now)?;
+        }
+        // The pushes ride in the SAME transaction as the rows and routes: a
+        // crash between them must not leave a half-pushed batch, or rows
+        // nobody was told about.
+        for event in &events {
+            enqueue_outbound_event(&tx, event, now, "bridge")?;
+        }
+        tx.commit()?;
+    }
+    if windowless {
+        if let Err(err) = crate::fork_dialog::pop_attach_window(thread_id) {
+            eprintln!("tinyctb question-gate: attach window: {err:#}");
+        }
+    }
+    Ok(no_opinion())
+}
+
 /// PostToolUse(AskUserQuestion): the authoritative "this question is answered"
 /// signal for a RELEASED background fork. It CLOSES the open row so the
 /// open-prompt scan stops re-offering it and a stale phone tap dedups — even
@@ -1395,6 +1562,12 @@ pub(crate) fn run_question_answered_gate<R: Read>(reader: &mut R, now: u64) -> R
     // check — and take a writable connection (and the writer lock) ONLY when
     // there is actually an open native row to close.
     if !crate::state::session_has_open_native_question_readonly(&path, thread_id) {
+        // Nothing native to settle — e.g. a multi-question batch whose tabs
+        // were all notify-only has no row — but the gate still popped a
+        // viewer window for it, and the question is answered now: close it.
+        // Cheap (a /proc scan), and only ever a window carrying the daemon's
+        // marker.
+        crate::fork_dialog::close_attach_windows(thread_id);
         return Ok(no_opinion());
     }
     // The fork's OWN result is the AUTHORITATIVE answer. `tool_response.answers`
@@ -4131,6 +4304,102 @@ mod tests {
     fn question_gate(payload: Value) -> Value {
         let mut reader = std::io::Cursor::new(payload.to_string());
         run_question_gate(&mut reader, 1000).expect("question gate")
+    }
+
+    /// A call with SEVERAL questions (0.2.16) on a background fork: the gate
+    /// no longer steps aside silently. Every question is pushed — one message
+    /// per tab — and each single-select tab gets its own native row sharing
+    /// the call's batch (its tool_use_id) with its tab index; a tab the
+    /// injector cannot drive (multi-select) is pushed notify-only, with no
+    /// row. The call itself is released (`{}`) so the tabbed dialog renders.
+    #[test]
+    fn a_multi_question_call_on_a_background_fork_pushes_every_tab() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("windowless-batch", true, 30);
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
+        let mut payload = question_payload();
+        payload["tool_use_id"] = json!("toolu-batch-1");
+        payload["tool_input"] = json!({ "questions": [
+            { "question": "颜色？", "header": "Color",
+              "options": [{"label": "RED"}, {"label": "GREEN"}] },
+            { "question": "配料？", "header": "Toppings", "multiSelect": true,
+              "options": [{"label": "A"}, {"label": "B"}] },
+            { "question": "尺寸？", "header": "Size",
+              "options": [{"label": "SMALL"}, {"label": "LARGE"}] }
+        ]});
+        let started = std::time::Instant::now();
+        let result = question_gate(payload);
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "0");
+        assert_eq!(result, json!({}), "released to the native tabbed dialog");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "released, not held"
+        );
+
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        // Rows: the two single-select tabs, sharing the batch, tab indexes 0
+        // and 2 of 3 — the multi-select tab in between gets no row.
+        type Row = (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let mut rows: Vec<Row> = conn
+            .prepare(
+                "SELECT question, batch_id, batch_seq, batch_total, native_attach
+                 FROM pending_questions WHERE thread_id = 'sess-q' ORDER BY batch_seq",
+            )
+            .expect("prepare")
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(
+            rows.remove(0),
+            (
+                "颜色？".to_string(),
+                Some("toolu-batch-1".to_string()),
+                Some(0),
+                Some(3),
+                Some(1)
+            )
+        );
+        assert_eq!(
+            rows.remove(0),
+            (
+                "尺寸？".to_string(),
+                Some("toolu-batch-1".to_string()),
+                Some(2),
+                Some(3),
+                Some(1)
+            )
+        );
+        // Pushes: one message per tab, the multi-select one included.
+        let pushes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events WHERE event_type = 'question_request'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(pushes, 3);
+        let notify_only: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events
+                 WHERE event_type = 'question_request' AND payload_json LIKE '%多选题%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            notify_only, 1,
+            "the multi-select tab is pushed as a notice to answer at the PC"
+        );
     }
 
     /// The fixture's isolation is itself a contract: every variable it
