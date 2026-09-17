@@ -930,6 +930,16 @@ fn send_claude_reply_to_thread(
     let route = crate::state::session_messaging_route(conn, thread_id)?;
     let unverified = route.as_ref().is_some_and(|(_, unverified)| *unverified);
     let live_socket = route.map(|(socket, _)| socket);
+    if live_socket.is_some() {
+        // BEFORE the bytes reach the session: its UserPromptSubmit hook may run
+        // the instant the socket write lands, and that hook must already see
+        // this prompt as phone-driven (it then skips capturing the desktop's
+        // active window as the session's terminal). Best-effort — a failed mark
+        // must not block the user's message.
+        if let Err(err) = crate::state::mark_phone_prompt(conn, thread_id, now) {
+            eprintln!("tinyctb: phone-prompt mark failed for {thread_id}: {err:#}");
+        }
+    }
     let injected = match live_socket.as_ref() {
         Some(socket) => crate::claude::inject_into_live_session(
             &socket.path,
@@ -2775,6 +2785,58 @@ fn inject_native_attach_answer(
             .map(|status| status == crate::state::QuestionStatus::Open)
             .unwrap_or(false)
     };
+    // An INTERACTIVE session's released question (v0.2.17) is answered by
+    // XTEST-typing the option's digit into its terminal WINDOW — its pty
+    // belongs to the terminal emulator, not a `bg-pty-host` a client can
+    // attach, so `claude attach` is not an option. `inject_window` set is the
+    // signal; single-select only, so never a batch/Submit path here.
+    if let Some(window) = prompt.inject_window {
+        // After the claim the row reads `Delivered`, so "still ours" is
+        // "not answered / expired / gone" rather than strictly `Open`.
+        let still_ours = || {
+            matches!(
+                crate::state::pending_question_status(conn, question_id, now),
+                Ok(crate::state::QuestionStatus::Open)
+                    | Ok(crate::state::QuestionStatus::Delivered)
+            )
+        };
+        let gates = crate::fork_dialog::XtestGates {
+            still_open: &still_open,
+            // Stamp BEFORE the first key. A failed write is a lost claim:
+            // nothing is typed, and the tap stays retryable.
+            claim: &|| {
+                crate::state::claim_question_delivery(conn, question_id, now).unwrap_or(false)
+            },
+            still_ours: &still_ours,
+            release: &|| {
+                if let Err(err) = crate::state::release_question_delivery(conn, question_id) {
+                    eprintln!("tinyctb: xtest claim not released ({question_id}): {err:#}");
+                }
+            },
+        };
+        return Ok(
+            match crate::fork_dialog::inject_option_via_xtest(window, index, &gates) {
+                // Keys reached the terminal. Not an ANSWER — the PostToolUse hook
+                // records the session's own result (whichever surface won). The
+                // row was already stamped delivered by the claim, before any key.
+                crate::fork_dialog::InjectOutcome::Delivered => (
+                    format!("已把「{resolved}」送到电脑上的对话框，由它确认后记录。"),
+                    ApprovalAnswer::Delivered,
+                    false,
+                ),
+                // No key was sent (window gone / not focused / row no longer
+                // open / claim lost) — the row stays open for the keyboard, the
+                // hook, or another tap.
+                crate::fork_dialog::InjectOutcome::SubmitPending
+                | crate::fork_dialog::InjectOutcome::Unreachable => (
+                    "没能把答案送进电脑上的对话框，请在电脑窗口作答（未记录，可重试）。"
+                        .to_string(),
+                    ApprovalAnswer::Unknown,
+                    true,
+                ),
+            },
+        );
+    }
     // A tab of a multi-question call carries its tab index: the injector
     // navigates there first, so the phone may answer the tabs in any order.
     let multi = prompt.batch.map(|b| crate::fork_dialog::MultiTab {
@@ -7907,6 +7969,82 @@ mod tests {
             "the inject side records nothing — the PostToolUse hook finalises the row"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v0.2.17: an INTERACTIVE session's released question carries an
+    /// `inject_window`, so the phone answer is XTEST-typed into that terminal
+    /// window (never `claude attach`). Delivered → marked delivered, records
+    /// nothing (the PostToolUse hook finalises it), not retryable.
+    #[test]
+    fn an_interactive_answer_is_xtest_typed_into_its_window() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::create_pending_question(
+            &conn,
+            "qi1",
+            "sess-win",
+            "选哪个数据库？",
+            &["Postgres".to_string(), "SQLite".to_string()],
+            false,
+            1000,
+            9_000_000,
+        )
+        .expect("create");
+        crate::state::mark_question_xtest_window(&conn, "qi1", 0x2a526d7).expect("mark");
+
+        std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
+        let (toast, outcome, retryable) =
+            inject_native_attach_answer(&conn, "qi1", "SQLite", 2000).expect("inject");
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+
+        assert_eq!(toast, "已把「SQLite」送到电脑上的对话框，由它确认后记录。");
+        assert_eq!(outcome, ApprovalAnswer::Delivered);
+        assert!(!retryable);
+        assert_eq!(
+            crate::state::pending_question_status(&conn, "qi1", 2500).expect("status"),
+            crate::state::QuestionStatus::Delivered,
+            "marked delivered so a re-tap types nothing more"
+        );
+        assert!(
+            crate::state::question_answer(&conn, "qi1")
+                .expect("answer")
+                .is_none(),
+            "the inject side records nothing"
+        );
+    }
+
+    /// v0.2.17: an interactive answer whose window cannot be reached is
+    /// retryable and delivers nothing — the row stays open for the keyboard or
+    /// the hook.
+    #[test]
+    fn an_interactive_answer_is_retryable_when_the_window_is_unreachable() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::create_pending_question(
+            &conn,
+            "qi2",
+            "sess-win",
+            "选哪个？",
+            &["Postgres".to_string(), "SQLite".to_string()],
+            false,
+            1000,
+            9_000_000,
+        )
+        .expect("create");
+        crate::state::mark_question_xtest_window(&conn, "qi2", 0x2a526d7).expect("mark");
+
+        std::env::set_var("TINYCTB_TEST_XTEST", "unreachable");
+        let (_, outcome, retryable) =
+            inject_native_attach_answer(&conn, "qi2", "SQLite", 2000).expect("inject");
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+
+        assert_eq!(outcome, ApprovalAnswer::Unknown);
+        assert!(retryable);
+        assert_eq!(
+            crate::state::pending_question_status(&conn, "qi2", 2500).expect("status"),
+            crate::state::QuestionStatus::Open,
+            "row left open for another surface / the hook"
+        );
     }
 
     /// A real screen is up but it is NOT the selector (answered at the keyboard,

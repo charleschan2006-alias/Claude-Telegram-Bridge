@@ -525,10 +525,17 @@ fn away_mode_active() -> bool {
 /// instruction: list the options at the end and wait for the reply.
 /// At the keyboard (away off) this prints nothing and costs nothing.
 pub(crate) fn run_prompt_context<R: Read>(reader: &mut R) -> Value {
-    // Drain stdin so the hook pipe closes cleanly; the payload itself is
-    // not needed — the decision keys on away mode and the turn token.
+    // Drain stdin so the hook pipe closes cleanly. The payload carries the
+    // session_id, which the window-capture below reads; the away/headless
+    // decision keys only on away mode and the turn token.
     let mut raw = String::new();
     let _ = reader.take(1024 * 1024).read_to_string(&mut raw);
+    // Opportunistically remember which terminal window this interactive session
+    // runs in (v0.2.17), so a phone answer can later be XTEST-typed into its
+    // native selector. Runs regardless of away — the window is captured during
+    // ordinary local use and reused when the user goes away later. Best-effort:
+    // any error is swallowed, the hook never fails for it.
+    let _ = remember_session_window(&raw);
     if !away_mode_active() {
         return json!({});
     }
@@ -546,6 +553,111 @@ pub(crate) fn run_prompt_context<R: Read>(reader: &mut R) -> Value {
             "additionalContext": context
         }
     })
+}
+
+/// Capture (and keep current) the session's terminal X window, at the only
+/// moment it can be done reliably: this is a Window session, local keyboard input is fresh (so
+/// the active window is provably this terminal — the user just typed here). It
+/// runs on every such prompt and rewrites the binding only when it changed. Ordered so a session driven from the phone (no
+/// fresh local input) never even opens the DB. The stored id is reused
+/// indefinitely to XTEST a phone answer into this terminal (see
+/// `fork_dialog::inject_option_via_xtest`).
+fn remember_session_window(raw_payload: &str) -> Result<()> {
+    if crate::claude::current_session_window() != crate::claude::SessionWindow::Window {
+        return Ok(());
+    }
+    let now = crate::now_millis()?;
+    // No fresh local input means either a phone-driven prompt (the active
+    // window is not this terminal) or a stale one — either way, do not guess a
+    // window, and do not even open the DB.
+    if !local_input_fresh(now, 5000) {
+        return Ok(());
+    }
+    let payload: Value = serde_json::from_str(raw_payload.trim()).unwrap_or(Value::Null);
+    let session_id = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if session_id.is_empty() {
+        return Ok(());
+    }
+    // CAUSAL, not timed: a message the daemon pushed in from the phone carries
+    // the `telegram：` prefix in the prompt itself (`telegram.rs` adds it), and
+    // THIS hook invocation is the one for THAT prompt — however long it sat in
+    // the session's queue. Such a prompt says nothing about the desktop, so it
+    // never captures. (The time-window mark below stays as a second fence.)
+    if prompt_is_phone_driven(&payload) {
+        return Ok(());
+    }
+    let path = state_db_path()?;
+    // A PHONE-driven prompt is not proof of anything about the desktop: the
+    // daemon stamps `mark_phone_prompt` BEFORE it writes a phone message into
+    // this session's socket, so the mark is committed before this hook can run
+    // for it (and an unreadable mark suppresses too). `local_input_fresh` is a GLOBAL
+    // signal — if the user happens to be typing in ANOTHER terminal while the
+    // phone submits here, the active window is that other terminal, and
+    // capturing it would pollute a correct binding. So a recent injection for
+    // this session skips the capture entirely.
+    if crate::state::phone_prompt_suppresses_capture_readonly(&path, session_id, now, 15_000) {
+        return Ok(());
+    }
+    // What we remember today — a READ-ONLY probe, so an unchanged mapping never
+    // opens a writable connection (which runs schema/migration writes and takes
+    // a busy-timeout write lock the daemon contends with).
+    let stored = crate::state::session_terminal_window_readonly(&path, session_id);
+    // Capture the active terminal on EVERY fresh-local prompt, not just the
+    // first: a session that MOVED (`claude --resume` in a different terminal)
+    // must re-bind to its new window instead of leaving the old XID
+    // authoritative forever. The capture is a cheap read-only python probe.
+    let Some(window) = crate::fork_dialog::capture_active_terminal_window() else {
+        return Ok(());
+    };
+    // Unchanged → no write (never take the write lock for a no-op).
+    if stored == Some(window) {
+        return Ok(());
+    }
+    // New or moved: ONE atomic `INSERT OR REPLACE` (last-writer-wins). Two
+    // capturers racing on the same session converge to the latest capture —
+    // no lost update from a non-atomic SELECT-then-INSERT. This writable open
+    // also creates the table on a DB upgraded from before this feature.
+    let conn = create_state_db(&path)?;
+    crate::state::set_session_terminal_window(&conn, session_id, window, now)?;
+    Ok(())
+}
+
+/// True when this UserPromptSubmit payload's prompt was injected by the daemon
+/// from Telegram — recognised by the `telegram：` prefix every such message is
+/// given. An absent / non-string prompt reads as NOT phone-driven here; the
+/// caller's other fences (fresh local input, the phone-prompt mark) still apply.
+fn prompt_is_phone_driven(payload: &Value) -> bool {
+    payload
+        .get("prompt")
+        .and_then(Value::as_str)
+        .is_some_and(|prompt| prompt.trim_start().starts_with("telegram："))
+}
+
+/// True when the desktop keyboard/pointer stamped `input-activity.json` within
+/// `within_ms` of `now_ms` — the daemon's xinput listener writes it. Any error
+/// (no file, no X listener, unparseable) reads as NOT fresh: never claim local
+/// presence we cannot see.
+fn local_input_fresh(now_ms: u64, within_ms: u64) -> bool {
+    let Ok(dir) = crate::state::state_dir_path() else {
+        return false;
+    };
+    let path = dir.join(crate::daemon::INPUT_ACTIVITY_FILE);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    match value.get("lastInputAtMs").and_then(Value::as_u64) {
+        // A stamp in the FUTURE (clock skew, a wrong-clock write) must NOT read
+        // as fresh: `saturating_sub` would clamp it to 0 and pass. Require the
+        // stamp at-or-before now AND within the window.
+        Some(last) => last <= now_ms && now_ms - last <= within_ms,
+        None => false,
+    }
 }
 
 pub(crate) fn run_approval_gate<R: Read>(reader: &mut R, now: u64) -> Result<Value> {
@@ -1238,6 +1350,31 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     // filled. Record that decision on the row now — the one source of truth
     // the phone side reads at tap time, instead of re-guessing from /proc.
     let native_attach = windowless && !multi_select && !options.is_empty();
+    // An INTERACTIVE (Window) session's single-select, non-empty question is
+    // ALSO released — but into its OWN terminal's native selector, which the
+    // person at the keyboard answers directly (the law: PC 永远能回答), and a
+    // phone answer is XTEST-typed into that same terminal window. This needs a
+    // REMEMBERED window (captured while local input was fresh); without one we
+    // cannot address the terminal, so the question keeps the held path (the
+    // phone fills it, exactly as before). Never for a windowless fork (it has
+    // no terminal window — it uses `claude attach`), so the two are exclusive.
+    // Requires a VERIFIED `Window` session — NOT merely `!windowless`, which
+    // also admits `Unverified` (an unreadable /proc). We only XTEST into a
+    // terminal we positively measured to be one; an unverified session with a
+    // stale remembered window keeps the held path.
+    let xtest_window = if session_window == crate::claude::SessionWindow::Window
+        && !multi_select
+        && !options.is_empty()
+    {
+        crate::state::session_terminal_window(&conn, &thread_id)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    // Either release path lets the NATIVE selector render (no held banner, the
+    // real dialog is the visible surface); only the held path paints a banner.
+    let released = native_attach || xtest_window.is_some();
     // Create the row, mark it native, and settle the fork's older open native
     // rows as ONE transaction: the "at most one open native row per fork"
     // invariant the phone side relies on must be durable, not a window between
@@ -1260,6 +1397,16 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         )?;
         if native_attach {
             crate::state::mark_question_native_attach(&tx, &question_id)?;
+            crate::state::settle_stale_native_questions(&tx, &thread_id, &question_id, now)?;
+        } else if let Some(window) = xtest_window {
+            crate::state::mark_question_xtest_window(&tx, &question_id, window)?;
+            // An interactive session has AT MOST one live question at a time
+            // (the tool blocks its own turn), so normally there is no stale
+            // sibling. But if a PRIOR question's PostToolUse settle failed (a
+            // lock, a timeout, a crash), its row stays Open and its old phone
+            // button could XTEST an old option into THIS new question. Settle
+            // any older open native row now — the same invariant the fork path
+            // relies on — so a stale tap reads Answered and bails.
             crate::state::settle_stale_native_questions(&tx, &thread_id, &question_id, now)?;
         }
         tx.commit()?;
@@ -1308,7 +1455,12 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     // 2026-08-22 — so the banner is the only trace a person at the screen
     // gets that anything is waiting, and /back is their answer path.
     let banner = QuestionBanner::for_session(windowless);
-    banner.paint_question(&question_text, &options, multi_select);
+    // A RELEASED question renders its real native selector — painting a held
+    // banner over it would just be noise. Only the held path (which shows no
+    // selector) needs the banner to make the wait visible at the screen.
+    if !released {
+        banner.paint_question(&question_text, &options, multi_select);
+    }
     // A background fork's single-select question is answered on its OWN
     // native dialog, from two surfaces at once (the user's law: 双向、谁
     //先抢答算谁的). Instead of holding the tool call and filling the
@@ -1329,6 +1481,13 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         if let Err(err) = crate::fork_dialog::pop_attach_window(&thread_id) {
             eprintln!("tinyctb question-gate: attach window: {err:#}");
         }
+        return Ok(no_opinion());
+    }
+    // An interactive session's released question needs NO window popped — its
+    // terminal already exists and is rendering the selector. Return no_opinion
+    // so that selector stays live for the keyboard, with the phone buttons the
+    // other surface (the daemon XTEST-types a tap into this same terminal).
+    if xtest_window.is_some() {
         return Ok(no_opinion());
     }
     let phone_answered = |answer: &str| {
@@ -4400,6 +4559,170 @@ mod tests {
             notify_only, 1,
             "the multi-select tab is pushed as a notice to answer at the PC"
         );
+    }
+
+    /// v0.2.17: an interactive (Window) session whose terminal window is
+    /// REMEMBERED releases its single-select question to that terminal's native
+    /// selector (no_opinion, no held banner) and marks the row so a phone tap is
+    /// XTEST-typed into the window — the PC keyboard and the phone both answer.
+    #[test]
+    fn a_window_session_with_a_remembered_window_releases_and_marks_it_for_xtest() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("xtest-release", true, 30);
+        // A Window session (the GateEnv default) that we have already captured
+        // a terminal window for.
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        crate::state::set_session_terminal_window(&conn, "sess-q", 0x2a526d7, 1000)
+            .expect("seed window");
+        drop(conn);
+
+        let started = std::time::Instant::now();
+        let result = question_gate(question_payload());
+        assert_eq!(
+            result,
+            json!({}),
+            "released to the terminal's native selector"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "released, not held"
+        );
+
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let (native, inject_window): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT native_attach, inject_window FROM pending_questions
+                 WHERE thread_id = 'sess-q'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(
+            native,
+            Some(1),
+            "routed through the native-attach phone path"
+        );
+        assert_eq!(
+            inject_window,
+            Some(0x2a526d7),
+            "the remembered window is stamped for XTEST"
+        );
+        let pushes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events
+                 WHERE event_type = 'question_request' AND payload_json LIKE '%\"buttons\"%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(pushes, 1, "one push, with tappable buttons");
+    }
+
+    /// v0.2.17: a prompt the daemon injected from Telegram is recognised by its
+    /// own `telegram：` prefix — causally, with no time window — and a locally
+    /// typed one is not.
+    #[test]
+    fn a_phone_injected_prompt_is_recognised_by_its_prefix() {
+        assert!(prompt_is_phone_driven(&json!({"prompt": "telegram：继续"})));
+        assert!(prompt_is_phone_driven(&json!({"prompt": "  telegram：x"})));
+        assert!(!prompt_is_phone_driven(
+            &json!({"prompt": "继续 telegram：x"})
+        ));
+        assert!(!prompt_is_phone_driven(&json!({"prompt": "local text"})));
+        assert!(!prompt_is_phone_driven(&json!({"session_id": "s"})));
+    }
+
+    /// v0.2.17 guard: a Window session with NO remembered window keeps the
+    /// unchanged HELD path — the phone fills the answer, the row is never marked
+    /// for XTEST — so nothing is released to a window we cannot address.
+    #[test]
+    fn a_window_session_without_a_remembered_window_still_holds() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("no-window-holds", true, 120);
+        // A tap lands from the phone after the gate is already holding.
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(800));
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            let id: String = conn
+                .query_row(
+                    "SELECT question_id FROM pending_questions WHERE thread_id = 'sess-q'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("question row");
+            crate::state::record_question_answer(&conn, &id, "Postgres", 2000).expect("tap");
+        });
+        let result = question_gate(question_payload());
+        writer.join().expect("writer");
+
+        assert!(
+            result["systemMessage"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("已由手机作答"),
+            "held path filled the answer from the phone: {result}"
+        );
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let (native, inject_window): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT native_attach, inject_window FROM pending_questions
+                 WHERE thread_id = 'sess-q'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(native, None, "never released");
+        assert_eq!(inject_window, None, "never marked for XTEST");
+    }
+
+    /// v0.2.17 guard: an UNVERIFIED session (the /proc probe could not tell) is
+    /// never released, even when a window was remembered for it earlier — we
+    /// only XTEST into a terminal positively measured to be one. `!windowless`
+    /// would have admitted this case; `== SessionWindow::Window` must not.
+    #[test]
+    fn an_unverified_session_with_a_remembered_window_still_holds() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("unverified-holds", true, 120);
+        let _window =
+            crate::state::EnvVarGuard::set("TINYCTB_TEST_SESSION_WINDOWLESS", "unverified");
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        crate::state::set_session_terminal_window(&conn, "sess-q", 0x2a526d7, 1000)
+            .expect("seed window");
+        drop(conn);
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(800));
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            let id: String = conn
+                .query_row(
+                    "SELECT question_id FROM pending_questions WHERE thread_id = 'sess-q'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("question row");
+            crate::state::record_question_answer(&conn, &id, "Postgres", 2000).expect("tap");
+        });
+        let result = question_gate(question_payload());
+        writer.join().expect("writer");
+
+        assert!(
+            result["systemMessage"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("已由手机作答"),
+            "an unverified session keeps the held path: {result}"
+        );
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let (native, inject_window): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT native_attach, inject_window FROM pending_questions
+                 WHERE thread_id = 'sess-q'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(native, None, "never released");
+        assert_eq!(inject_window, None, "never marked for XTEST");
     }
 
     /// The fixture's isolation is itself a contract: every variable it

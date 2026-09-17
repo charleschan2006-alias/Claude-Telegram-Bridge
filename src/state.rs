@@ -841,6 +841,17 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
           reply TEXT,
           created_at INTEGER NOT NULL
         );
+        -- The X window id of the terminal an INTERACTIVE session is running in,
+        -- captured at each locally typed UserPromptSubmit (local keyboard input
+        -- fresh, never a phone-injected prompt) and rewritten only when it
+        -- changed, so a session resumed in another terminal re-binds. Used to
+        -- XTEST-type a phone answer into that terminal's native selector — the
+        -- interactive equivalent of the fork's `claude attach` inject path.
+        CREATE TABLE IF NOT EXISTS session_terminal_windows (
+          thread_id TEXT PRIMARY KEY,
+          x_window_id INTEGER NOT NULL,
+          captured_at INTEGER NOT NULL
+        );
         ",
     )?;
     ensure_column(
@@ -929,6 +940,11 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "pending_questions", "batch_seq", "INTEGER")?;
     ensure_column(conn, "pending_questions", "batch_total", "INTEGER")?;
     ensure_column(conn, "pending_questions", "delivered_at", "INTEGER")?;
+    // Set only for an INTERACTIVE (Window) session's released question: the X
+    // window id its native selector renders in, into which a phone answer is
+    // XTEST-typed. NULL for a held row and for a background fork's attach row
+    // (the phone side reads this to pick XTEST vs `claude attach`).
+    ensure_column(conn, "pending_questions", "inject_window", "INTEGER")?;
     ensure_column(conn, "pending_prompts", "transcript_bytes", "INTEGER")?;
     ensure_column(conn, "pending_prompts", "notification_type", "TEXT")?;
     // WHICH INSTANCE of a prompt this row is. The id is `notify:{received_at}`
@@ -3653,6 +3669,109 @@ pub(crate) fn mark_question_native_attach(conn: &Connection, question_id: &str) 
     Ok(())
 }
 
+/// Remember which terminal X window an interactive session is running in.
+/// Called at a locally typed UserPromptSubmit (local keyboard input fresh, so
+/// the active window is this session's) whenever the captured window differs
+/// from the stored one. Used to XTEST a phone answer into that terminal's
+/// native selector.
+pub(crate) fn set_session_terminal_window(
+    conn: &Connection,
+    thread_id: &str,
+    x_window_id: i64,
+    now: u64,
+) -> Result<()> {
+    // Monotonic upsert: a later capture wins, but an OLDER capture that raced
+    // and arrives late can NEVER clobber a newer one (the `WHERE excluded... >=`
+    // guard). Two capturers on the same session thus converge to the latest,
+    // guaranteed by SQL, not just by call order.
+    conn.execute(
+        "INSERT INTO session_terminal_windows(thread_id, x_window_id, captured_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(thread_id) DO UPDATE SET
+           x_window_id = excluded.x_window_id,
+           captured_at = excluded.captured_at
+         WHERE excluded.captured_at >= session_terminal_windows.captured_at",
+        params![thread_id, x_window_id, to_sql_i64(now)?],
+    )?;
+    Ok(())
+}
+
+/// The daemon is about to push a PHONE message into this live session. Stamped
+/// BEFORE the bytes are written to the session's socket, so the mark is durably
+/// committed before the session can possibly run its UserPromptSubmit hook for
+/// that message — a happens-before edge the post-hoc `live_injections` debt row
+/// (written only after the socket write returns) cannot give. Never undone: a
+/// mark for a message that then failed to send merely skips one window capture.
+pub(crate) fn mark_phone_prompt(conn: &Connection, thread_id: &str, now: u64) -> Result<()> {
+    set_setting(conn, &format!("phone_prompt_at:{thread_id}"), now)
+}
+
+/// Read-only: must the UserPromptSubmit window capture be SUPPRESSED because
+/// this prompt may be phone-driven? True when [`mark_phone_prompt`] stamped this
+/// session within `within_ms` of `now` — and ALSO true when the mark cannot be
+/// read at all (no DB, locked, unparseable): the capture is an optimisation, so
+/// "cannot prove it was typed locally" skips it and the next local prompt
+/// captures instead. A stamp in the future is treated as recent for the same
+/// reason. Only a readable, absent-or-old mark allows a capture.
+pub(crate) fn phone_prompt_suppresses_capture_readonly(
+    db_path: &Path,
+    thread_id: &str,
+    now_ms: u64,
+    within_ms: u64,
+) -> bool {
+    let Ok(conn) = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return true;
+    };
+    let value: rusqlite::Result<Option<String>> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![format!("phone_prompt_at:{thread_id}")],
+            |row| row.get(0),
+        )
+        .optional();
+    match value {
+        Ok(None) => false,
+        Ok(Some(raw)) => match raw.trim().parse::<u64>() {
+            Ok(at) => at > now_ms || now_ms - at <= within_ms,
+            Err(_) => true,
+        },
+        Err(_) => true,
+    }
+}
+
+/// The remembered terminal X window id for a session, or `None` if one was
+/// never captured (a fork, a session started before capture, or a session the
+/// user has only ever driven from the phone).
+pub(crate) fn session_terminal_window(conn: &Connection, thread_id: &str) -> Result<Option<i64>> {
+    let id: Option<i64> = conn
+        .query_row(
+            "SELECT x_window_id FROM session_terminal_windows WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
+/// Mark an already-created question as one the gate RELEASED to an INTERACTIVE
+/// session's native selector, whose answer is XTEST-typed into the terminal X
+/// window `x_window_id`. `native_attach = 1` so the phone side routes through
+/// `question_is_native_attach`; `inject_window` being set is what tells that
+/// side to XTEST into a window rather than drive a `claude attach` client.
+pub(crate) fn mark_question_xtest_window(
+    conn: &Connection,
+    question_id: &str,
+    x_window_id: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_questions SET native_attach = 1, inject_window = ?2
+         WHERE question_id = ?1",
+        params![question_id, x_window_id],
+    )?;
+    Ok(())
+}
+
 /// Stamp a row as ONE tab of a multi-question call (0.2.16): `batch_id` groups
 /// the call's rows (its tool_use_id), `seq` is this question's 0-based tab
 /// index, `total` the tab count. Set right after creation, in the same
@@ -3685,6 +3804,35 @@ pub(crate) fn mark_question_delivered(
         "UPDATE pending_questions SET delivered_at = ?2
          WHERE question_id = ?1 AND delivered_at IS NULL",
         params![question_id, to_sql_i64(now)?],
+    )?;
+    Ok(())
+}
+
+/// Atomically CLAIM the delivery of an interactive (XTEST) answer BEFORE any key
+/// is typed: stamps `delivered_at` only if the row is still unanswered and
+/// unclaimed, and reports whether THIS caller won. Two racing taps cannot both
+/// win, and because the stamp precedes the keys, no later write failure can
+/// leave a typed-into question reading open (and re-offered by `/threads`).
+pub(crate) fn claim_question_delivery(
+    conn: &Connection,
+    question_id: &str,
+    now: u64,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE pending_questions SET delivered_at = ?2
+         WHERE question_id = ?1 AND delivered_at IS NULL AND answer IS NULL",
+        params![question_id, to_sql_i64(now)?],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Undo [`claim_question_delivery`] when NO key was sent, so the button can be
+/// retried. Never reopens an answered row.
+pub(crate) fn release_question_delivery(conn: &Connection, question_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_questions SET delivered_at = NULL
+         WHERE question_id = ?1 AND answer IS NULL",
+        params![question_id],
     )?;
     Ok(())
 }
@@ -3928,6 +4076,11 @@ pub(crate) struct QuestionPrompt {
     /// tab's digit was already typed is a STATUS — `QuestionStatus::Delivered`
     /// from `pending_question_status` — not a prompt field.)
     pub(crate) batch: Option<QuestionBatch>,
+    /// `Some(window)` when this is an INTERACTIVE session's released question:
+    /// the phone answer is XTEST-typed into terminal X window `window`, not
+    /// injected through a `claude attach` client. `None` for a fork's attach
+    /// row (and for held rows, which are never routed here at all).
+    pub(crate) inject_window: Option<i64>,
 }
 
 pub(crate) fn question_prompt(
@@ -3941,10 +4094,11 @@ pub(crate) fn question_prompt(
         Option<i64>,
         Option<i64>,
         Option<i64>,
+        Option<i64>,
     );
     let row: Option<PromptRow> = conn
         .query_row(
-            "SELECT thread_id, options_json, native_attach, batch_seq, batch_total, delivered_at
+            "SELECT thread_id, options_json, native_attach, batch_seq, batch_total, delivered_at, inject_window
              FROM pending_questions WHERE question_id = ?1",
             params![question_id],
             |row| {
@@ -3955,26 +4109,30 @@ pub(crate) fn question_prompt(
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )
         .optional()?;
     Ok(row.map(
-        |(thread_id, options_json, native, seq, total, _delivered_at)| QuestionPrompt {
-            thread_id,
-            options: serde_json::from_str::<Vec<String>>(&options_json).unwrap_or_default(),
-            native_attach: native.unwrap_or(0) != 0,
-            // A batch needs a real tab index and MORE than one tab; anything
-            // else is an ordinary single-question row.
-            batch: match (seq, total) {
-                (Some(seq), Some(total)) if seq >= 0 && total > 1 && seq < total => {
-                    Some(QuestionBatch {
-                        seq: seq as usize,
-                        total: total as usize,
-                    })
-                }
-                _ => None,
-            },
+        |(thread_id, options_json, native, seq, total, _delivered_at, inject_window)| {
+            QuestionPrompt {
+                thread_id,
+                options: serde_json::from_str::<Vec<String>>(&options_json).unwrap_or_default(),
+                native_attach: native.unwrap_or(0) != 0,
+                // A batch needs a real tab index and MORE than one tab; anything
+                // else is an ordinary single-question row.
+                batch: match (seq, total) {
+                    (Some(seq), Some(total)) if seq >= 0 && total > 1 && seq < total => {
+                        Some(QuestionBatch {
+                            seq: seq as usize,
+                            total: total as usize,
+                        })
+                    }
+                    _ => None,
+                },
+                inject_window,
+            }
         },
     ))
 }
@@ -4189,6 +4347,26 @@ pub(crate) fn settle_stale_native_questions(
 /// this returns true. Any failure (missing/locked/unmigrated DB) degrades to
 /// `false`: the hook then does nothing and the row falls back to expiring, no
 /// worse than if PostToolUse had not fired.
+/// Read-only counterpart of [`session_terminal_window`]: does this session
+/// already have a remembered terminal window? The UserPromptSubmit capture
+/// runs on EVERY fresh-local prompt, so it must not open a writable connection
+/// (which runs the schema/migration writes and takes a busy-timeout write lock,
+/// contending with the daemon) just to answer "what is remembered?". The caller
+/// opens a writable connection only when the fresh capture DIFFERS from this
+/// (nothing remembered yet, or the session moved terminals).
+pub(crate) fn session_terminal_window_readonly(db_path: &Path, thread_id: &str) -> Option<i64> {
+    let conn =
+        Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    conn.query_row(
+        "SELECT x_window_id FROM session_terminal_windows WHERE thread_id = ?1",
+        params![thread_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
 pub(crate) fn session_has_open_native_question_readonly(db_path: &Path, thread_id: &str) -> bool {
     let Ok(conn) = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
     else {
@@ -9489,6 +9667,148 @@ mod tests {
         assert_eq!(
             question_answer(&conn, "q2").expect("read").as_deref(),
             Some("B")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// v0.2.17: a session's terminal window round-trips, and a question marked
+    /// for XTEST reads back both `native_attach` (so the phone routes through
+    /// the native-attach path) and its `inject_window` (so that path XTESTs
+    /// into a window rather than driving a `claude attach` client).
+    #[test]
+    fn a_session_window_round_trips_and_marks_a_question_for_xtest() {
+        let conn = create_state_db_in_memory().expect("db");
+        assert_eq!(
+            session_terminal_window(&conn, "sess-x").expect("read"),
+            None,
+            "nothing remembered yet"
+        );
+        set_session_terminal_window(&conn, "sess-x", 0x2a526d7, 1_000).expect("set");
+        assert_eq!(
+            session_terminal_window(&conn, "sess-x").expect("read"),
+            Some(0x2a526d7)
+        );
+        // A LATER capture replaces the id (the session moved terminals).
+        set_session_terminal_window(&conn, "sess-x", 0x999, 2_000).expect("replace");
+        assert_eq!(
+            session_terminal_window(&conn, "sess-x").expect("read"),
+            Some(0x999)
+        );
+        // An OLDER capture that raced and lands late must NOT clobber the newer
+        // one — the upsert is monotonic in `captured_at`.
+        set_session_terminal_window(&conn, "sess-x", 0x111, 1_500).expect("stale write");
+        assert_eq!(
+            session_terminal_window(&conn, "sess-x").expect("read"),
+            Some(0x999),
+            "a stale capture never overwrites a newer one"
+        );
+
+        let opts = vec!["甲".to_string(), "乙".to_string()];
+        create_pending_question(
+            &conn,
+            "qx",
+            "sess-x",
+            "选一个?",
+            &opts,
+            false,
+            1_000,
+            900_000,
+        )
+        .expect("row");
+        let before = question_prompt(&conn, "qx").expect("read").expect("row");
+        assert!(!before.native_attach);
+        assert_eq!(before.inject_window, None);
+
+        mark_question_xtest_window(&conn, "qx", 0x2a526d7).expect("mark");
+        let after = question_prompt(&conn, "qx").expect("read").expect("row");
+        assert!(after.native_attach, "phone routes through native-attach");
+        assert_eq!(after.inject_window, Some(0x2a526d7), "XTEST target window");
+        assert_eq!(
+            after.batch, None,
+            "a single interactive question is not a batch"
+        );
+    }
+
+    /// v0.2.17: the delivery claim is atomic and precedes the keys — one tap
+    /// wins, a loser types nothing, a release reopens only an unanswered row.
+    #[test]
+    fn a_delivery_claim_is_won_once_and_released_only_while_unanswered() {
+        let conn = create_state_db_in_memory().expect("db");
+        let opts = vec!["甲".to_string(), "乙".to_string()];
+        create_pending_question(&conn, "qc", "sess-c", "选?", &opts, false, 1_000, 900_000)
+            .expect("row");
+        assert!(claim_question_delivery(&conn, "qc", 2_000).expect("claim"));
+        assert!(
+            !claim_question_delivery(&conn, "qc", 2_001).expect("second"),
+            "a second tap loses the claim"
+        );
+        assert_eq!(
+            pending_question_status(&conn, "qc", 2_500).expect("status"),
+            QuestionStatus::Delivered
+        );
+        release_question_delivery(&conn, "qc").expect("release");
+        assert_eq!(
+            pending_question_status(&conn, "qc", 2_500).expect("status"),
+            QuestionStatus::Open,
+            "no key was sent, so the button may be retried"
+        );
+        record_question_answer(&conn, "qc", "甲", 3_000).expect("answer");
+        assert!(
+            !claim_question_delivery(&conn, "qc", 3_500).expect("late"),
+            "an answered row can never be claimed"
+        );
+        assert!(!claim_question_delivery(&conn, "missing", 3_500).expect("none"));
+    }
+
+    /// v0.2.17: the two READ-ONLY probes the UserPromptSubmit capture uses. The
+    /// window probe reads what the writable side stored. The phone-prompt probe
+    /// SUPPRESSES a capture for a recent (or future, or unreadable) mark and for
+    /// an unreadable DB, and allows it only for a readable absent-or-old mark.
+    #[test]
+    fn the_read_only_capture_probes_see_stored_windows_and_phone_prompts() {
+        let path =
+            std::env::temp_dir().join(format!("tinyctb-xtest-probes-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(session_terminal_window_readonly(&path, "sess-p"), None);
+        assert!(
+            phone_prompt_suppresses_capture_readonly(&path, "sess-p", 10_000, 15_000),
+            "an unreadable DB cannot prove the prompt was local"
+        );
+
+        let conn = create_state_db(&path).expect("db");
+        set_session_terminal_window(&conn, "sess-p", 0x2a526d7, 1_000).expect("set");
+        drop(conn);
+        assert_eq!(
+            session_terminal_window_readonly(&path, "sess-p"),
+            Some(0x2a526d7)
+        );
+        assert_eq!(session_terminal_window_readonly(&path, "other"), None);
+        assert!(
+            !phone_prompt_suppresses_capture_readonly(&path, "sess-p", 10_000, 15_000),
+            "no mark at all: a local prompt may capture"
+        );
+
+        let at = 1_700_000_000_000u64;
+        let conn = create_state_db(&path).expect("db");
+        mark_phone_prompt(&conn, "sess-p", at).expect("mark");
+        drop(conn);
+        assert!(phone_prompt_suppresses_capture_readonly(
+            &path,
+            "sess-p",
+            at + 5_000,
+            15_000
+        ));
+        assert!(
+            phone_prompt_suppresses_capture_readonly(&path, "sess-p", at - 5_000, 15_000),
+            "a mark in the future still suppresses"
+        );
+        assert!(
+            !phone_prompt_suppresses_capture_readonly(&path, "sess-p", at + 60_000, 15_000),
+            "an old mark no longer suppresses"
+        );
+        assert!(
+            !phone_prompt_suppresses_capture_readonly(&path, "other", at + 5_000, 15_000),
+            "another session's mark does not count"
         );
         let _ = std::fs::remove_file(&path);
     }

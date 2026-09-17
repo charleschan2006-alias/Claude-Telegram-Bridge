@@ -180,6 +180,201 @@ fn python3_bin() -> PathBuf {
     }
 }
 
+// ---- the interactive-session XTEST path (v0.2.17) -------------------------
+//
+// A background fork is answered through `claude attach`; an ORDINARY
+// interactive session cannot be — its terminal's pty belongs to
+// gnome-terminal, not to a `bg-pty-host` a client can attach. So its native
+// AskUserQuestion selector is driven the way a person at the keyboard would:
+// the daemon remembers which terminal X window the session runs in (captured
+// on each locally typed prompt, rewritten only when it changed) and, on a phone tap, focuses that window
+// and synthesizes the option digit + Return via XTEST. Both helpers are
+// embedded python-xlib scripts, materialized to the cache dir on use exactly
+// like the focus helper.
+
+/// Reads `_NET_ACTIVE_WINDOW` and prints its id iff it is a terminal.
+#[cfg(not(test))]
+const CAPTURE_HELPER_PY: &str = include_str!("capture_window.py");
+/// Focuses a terminal X window and types option digits + Return via XTEST.
+#[cfg(not(test))]
+const XTEST_HELPER_PY: &str = include_str!("xtest_answer.py");
+
+/// Publish an embedded helper to `~/.cache/tinyctb/<filename>` atomically
+/// (unique temp + rename, so a concurrent reader never sees a half-written
+/// script), rewriting only when the on-disk copy differs. `None` if the cache
+/// dir cannot be resolved or written — the caller then does nothing.
+#[cfg(not(test))]
+fn materialize_named_helper(filename: &str, content: &str) -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    let dir = base.join("tinyctb");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(filename);
+    let fresh = std::fs::read(&path)
+        .map(|c| c == content.as_bytes())
+        .unwrap_or(false);
+    if !fresh {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!("{filename}.{}.{}.tmp", std::process::id(), seq));
+        std::fs::write(&tmp, content).ok()?;
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+    }
+    Some(path)
+}
+
+/// Capture the X window id of the terminal the CURRENT process's session is
+/// running in, by reading the active window — valid to call only when local
+/// keyboard input is fresh, so the active window is provably this session's
+/// terminal. Runs the read-only capture helper; `None` on any failure (no X,
+/// no python-xlib, the active window is not a terminal, …), in which case the
+/// caller simply does not remember a window and the phone falls back to the
+/// held path for this session.
+pub(crate) fn capture_active_terminal_window() -> Option<i64> {
+    #[cfg(test)]
+    return match std::env::var("TINYCTB_TEST_CAPTURE_WINDOW").ok().as_deref() {
+        Some("none") | None => None,
+        Some(v) => v.parse::<i64>().ok(),
+    };
+    #[cfg(not(test))]
+    {
+        let helper = materialize_named_helper("capture_window.py", CAPTURE_HELPER_PY)?;
+        let mut cmd = Command::new(python3_bin());
+        cmd.arg(&helper).stdin(Stdio::null()).stderr(Stdio::null());
+        fill_x_env(&mut cmd);
+        let output = cmd.output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<i64>()
+            .ok()
+    }
+}
+
+/// The DB-side gates the XTEST injector consults between its steps. The row —
+/// not the screen — is the only identity a terminal we do not own can give us,
+/// so it is re-read before every step that matters.
+pub(crate) struct XtestGates<'a> {
+    /// Is this question still the session's OPEN, untouched row?
+    pub(crate) still_open: &'a dyn Fn() -> bool,
+    /// Atomically claim the delivery (stamp `delivered_at`) BEFORE the first
+    /// key. `false` = another tap already claimed it, or the write failed — in
+    /// both cases NOTHING is typed. Stamping first is what makes "keys were
+    /// sent but the row still reads open" impossible: no later DB failure can
+    /// re-offer a button that would type a second time.
+    pub(crate) claim: &'a dyn Fn() -> bool,
+    /// After the claim: is the row still unanswered (not settled by the
+    /// keyboard / the hook)? Checked right before the Return.
+    pub(crate) still_ours: &'a dyn Fn() -> bool,
+    /// Undo the claim — called only when NO key was sent, so the button may be
+    /// retried. Best-effort; a failed release leaves the row claimed (safe
+    /// side: nothing types again, the keyboard still answers).
+    pub(crate) release: &'a dyn Fn(),
+}
+
+/// One step of the XTEST helper (`focus` / `digits` / `enter`); `true` on exit 0.
+#[cfg(not(test))]
+fn run_xtest_step(args: &[&str]) -> bool {
+    let Some(helper) = materialize_named_helper("xtest_answer.py", XTEST_HELPER_PY) else {
+        return false;
+    };
+    let mut cmd = Command::new(python3_bin());
+    cmd.arg(&helper)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    fill_x_env(&mut cmd);
+    matches!(cmd.status(), Ok(status) if status.success())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The helper steps a test run "executed", in order.
+    pub(crate) static XTEST_STEPS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test stub: records the step; `TINYCTB_TEST_XTEST` names a step that FAILS
+/// (`focus` / `digits` / `enter`), `delivered` (or unset → nothing reachable)
+/// keeps the old two-value contract for callers that only need an outcome.
+#[cfg(test)]
+fn run_xtest_step(args: &[&str]) -> bool {
+    let step = args.first().copied().unwrap_or_default();
+    let mode = std::env::var("TINYCTB_TEST_XTEST").unwrap_or_default();
+    let ok = match mode.as_str() {
+        "delivered" => true,
+        "" | "unreachable" => false,
+        failing => failing != step,
+    };
+    if ok {
+        XTEST_STEPS.with(|s| s.borrow_mut().push(args.join(" ")));
+    }
+    ok
+}
+
+/// Type option `index` into an interactive session's native selector by
+/// XTEST-ing its 1-based digit, then Return, into terminal X window
+/// `x_window_id`. XTEST types into whatever holds the keyboard focus and we
+/// cannot see the terminal's screen, so every step is fenced by the row:
+///
+/// `still_open` → focus (slow, no keys) → `still_open` → `claim` → digits →
+/// beat → `still_ours` → Return.
+///
+/// A revocation before the claim types NOTHING (`Unreachable`, retryable). A
+/// failed digits step sent no key: the claim is released, `Unreachable`. Once a
+/// digit is out the outcome is `Delivered` whatever follows — if the keyboard
+/// answered during the beat (`still_ours` false) the Return is simply withheld.
+/// The PostToolUse hook records the session's own result authoritatively,
+/// whichever surface won. Never `SubmitPending`: single-select, no Submit tab.
+pub(crate) fn inject_option_via_xtest(
+    x_window_id: i64,
+    index: usize,
+    gates: &XtestGates,
+) -> InjectOutcome {
+    if !(gates.still_open)() {
+        return InjectOutcome::Unreachable;
+    }
+    let window = x_window_id.to_string();
+    if !run_xtest_step(&["focus", &window]) {
+        return InjectOutcome::Unreachable;
+    }
+    // The focus wait is the long step: re-read the row after it.
+    if !(gates.still_open)() {
+        return InjectOutcome::Unreachable;
+    }
+    // Claim BEFORE the first key; lose the claim → type nothing.
+    if !(gates.claim)() {
+        return InjectOutcome::Unreachable;
+    }
+    let digits = (index + 1).to_string();
+    if !run_xtest_step(&["digits", &window, &digits]) {
+        // Exit != 0 means NO key was sent (window not active / gone / …).
+        (gates.release)();
+        return InjectOutcome::Unreachable;
+    }
+    // A person keys "3 ⏎" with a beat; the selector needs it too.
+    std::thread::sleep(XTEST_KEY_GAP);
+    // The Return is the key that submits — only while the row is still ours.
+    if (gates.still_ours)() {
+        let _ = run_xtest_step(&["enter", &window]);
+    }
+    InjectOutcome::Delivered
+}
+
+/// The beat between the option digit and Return (zero in tests).
+#[cfg(not(test))]
+const XTEST_KEY_GAP: Duration = Duration::from_millis(250);
+#[cfg(test)]
+const XTEST_KEY_GAP: Duration = Duration::from_millis(0);
+
 /// Open the fork's native dialog in a desktop window. The window closes when
 /// `claude attach` exits (when the viewer detaches or the session ends).
 /// Fire-and-forget: a failure to pop the window is not fatal — the phone
@@ -1907,5 +2102,76 @@ mod tests {
         std::env::remove_var("TINYCTB_TEST_ATTACH");
         assert_eq!(outcome, InjectOutcome::Unreachable);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v0.2.17: the interactive XTEST inject is fenced by the row at every step.
+    #[test]
+    fn xtest_inject_is_fenced_by_the_row_at_every_step() {
+        let _guard = crate::state::test_env_lock();
+        let steps = || XTEST_STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        let released = std::cell::Cell::new(0u32);
+        let run = |open: &dyn Fn() -> bool, claim: bool, ours: bool| {
+            inject_option_via_xtest(
+                0x2a526d7,
+                2,
+                &XtestGates {
+                    still_open: open,
+                    claim: &|| claim,
+                    still_ours: &|| ours,
+                    release: &|| released.set(released.get() + 1),
+                },
+            )
+        };
+        std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
+        let _ = steps();
+
+        // The whole sequence, in order: focus, digit 3 (index 2), Return.
+        assert_eq!(run(&|| true, true, true), InjectOutcome::Delivered);
+        assert_eq!(
+            steps(),
+            ["focus 44377815", "digits 44377815 3", "enter 44377815"]
+        );
+        // Revoked up front: not even a focus request.
+        assert_eq!(run(&|| false, true, true), InjectOutcome::Unreachable);
+        assert!(steps().is_empty());
+        // Revoked DURING the focus wait (check #1 true, #2 false): focus only.
+        let calls = std::cell::Cell::new(0u32);
+        let during = || {
+            calls.set(calls.get() + 1);
+            calls.get() == 1
+        };
+        assert_eq!(run(&during, true, true), InjectOutcome::Unreachable);
+        assert_eq!(steps(), ["focus 44377815"]);
+        // Lost the claim (another tap, or the stamp failed): no key.
+        assert_eq!(run(&|| true, false, true), InjectOutcome::Unreachable);
+        assert_eq!(steps(), ["focus 44377815"]);
+        // Answered at the keyboard during the beat: the digit is out, the
+        // Return is WITHHELD, and it is still Delivered (never retryable).
+        assert_eq!(run(&|| true, true, false), InjectOutcome::Delivered);
+        assert_eq!(steps(), ["focus 44377815", "digits 44377815 3"]);
+        assert_eq!(released.get(), 0, "nothing released while keys went out");
+
+        // The digits step sent nothing: the claim is released, retryable.
+        std::env::set_var("TINYCTB_TEST_XTEST", "digits");
+        assert_eq!(run(&|| true, true, true), InjectOutcome::Unreachable);
+        assert_eq!(steps(), ["focus 44377815"]);
+        assert_eq!(released.get(), 1);
+        // A failed Return after the digit is still Delivered.
+        std::env::set_var("TINYCTB_TEST_XTEST", "enter");
+        assert_eq!(run(&|| true, true, true), InjectOutcome::Delivered);
+        let _ = steps();
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+    }
+
+    /// v0.2.17: the capture helper's stub returns the remembered window id, and
+    /// "none" reads as no capture.
+    #[test]
+    fn capture_reads_the_window_from_the_stub() {
+        let _guard = crate::state::test_env_lock();
+        std::env::set_var("TINYCTB_TEST_CAPTURE_WINDOW", "44304567");
+        assert_eq!(capture_active_terminal_window(), Some(44304567));
+        std::env::set_var("TINYCTB_TEST_CAPTURE_WINDOW", "none");
+        assert_eq!(capture_active_terminal_window(), None);
+        std::env::remove_var("TINYCTB_TEST_CAPTURE_WINDOW");
     }
 }
