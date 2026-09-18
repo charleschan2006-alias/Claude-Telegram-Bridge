@@ -111,7 +111,7 @@ exist.
 **Prebuilt binary (Linux x86_64, recommended — no Rust toolchain needed):**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/charleschan2006-alias/tinyCTB/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/charleschan2006-alias/Claude-Telegram-Bridge/main/scripts/install.sh | bash
 ```
 
 Installs a static musl build (runs on any Linux x86_64, no system libraries)
@@ -123,7 +123,7 @@ hooks, daemon service).
 process-identity checks are Linux-only):**
 
 ```bash
-cargo install --locked --git https://github.com/charleschan2006-alias/tinyCTB
+cargo install --locked --git https://github.com/charleschan2006-alias/Claude-Telegram-Bridge
 # or, from a checkout:
 cargo install --locked --path .
 ```

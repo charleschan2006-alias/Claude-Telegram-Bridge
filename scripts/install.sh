@@ -2,14 +2,14 @@
 # tinyCTB installer: downloads the latest prebuilt release binary — no Rust
 # toolchain, no source checkout. Usage:
 #
-#   curl -fsSL https://raw.githubusercontent.com/charleschan2006-alias/tinyCTB/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/charleschan2006-alias/Claude-Telegram-Bridge/main/scripts/install.sh | bash
 #
 # Installs to ~/.local/bin/tinyctb (override with TINYCTB_INSTALL_DIR).
 # The binary is a static musl build: it runs on any Linux x86_64, no
 # system libraries required.
 set -euo pipefail
 
-REPO="charleschan2006-alias/tinyCTB"
+REPO="charleschan2006-alias/Claude-Telegram-Bridge"
 INSTALL_DIR="${TINYCTB_INSTALL_DIR:-$HOME/.local/bin}"
 
 fail() {
