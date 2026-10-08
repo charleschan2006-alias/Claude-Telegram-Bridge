@@ -6,8 +6,20 @@ between every one of them (the answer may be given at the keyboard at any time):
 
   xtest_answer.py focus  <x_window_id>
       Send an EWMH `_NET_ACTIVE_WINDOW` ClientMessage with source=2 (which Mutter
-      honours as a direct user request) and wait up to ~1.5s for the focus to
-      land. The only slow step; sends no keys.
+      honours as a direct user request) and a REAL server timestamp, and wait up
+      to ~3s for the focus to land. The only slow step; sends no keys.
+
+      The timestamp matters: Mutter only switches WORKSPACE for an activation
+      that carries a real timestamp (`allow_workspace_switch = timestamp != 0`).
+      With `CurrentTime` (0) a window on another workspace is never focused — it
+      merely gets `_NET_WM_STATE_DEMANDS_ATTENTION` — and this step used to fail
+      with 4 whenever the session's terminal sat on a workspace other than the
+      current one (real machine, 2026-10-08). The timestamp comes from a
+      PropertyNotify round-trip on a private, unmapped window of our own; if that
+      cannot be had, `CurrentTime` is still sent (the same-workspace case keeps
+      working). The wait is generous because a workspace switch animates, and
+      under load the focus was seen to land after more than 2s. Total: one X
+      round-trip for the timestamp plus at most 3s of polling (monotonic clock).
 
   xtest_answer.py digits <x_window_id> <digits>
       Type the option digit(s). Never waits, never re-focuses: if the window is
@@ -69,17 +81,75 @@ def do_focus(target):
     if not _is_terminal(win, WC, X):
         return 3
 
-    ev = protocol.event.ClientMessage(
-        window=win, client_type=AW, data=(32, [2, X.CurrentTime, 0, 0, 0])
-    )
-    root.send_event(ev, event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask)
-    d.flush()
-    deadline = time.time() + 1.5
-    while time.time() < deadline:
-        if active() == target:
-            return 0
-        time.sleep(0.05)
-    return 0 if active() == target else 4
+    def activate(timestamp):
+        # data.l[0]=2: source is a pager / direct user action; l[1]: a real
+        # server timestamp so the WM may switch workspace (see the module doc).
+        ev = protocol.event.ClientMessage(
+            window=win, client_type=AW, data=(32, [2, timestamp, 0, 0, 0])
+        )
+        root.send_event(
+            ev, event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask
+        )
+        d.flush()
+
+    def wait_active(seconds):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if active() == target:
+                return True
+            time.sleep(0.05)
+        return active() == target
+
+    activate(_server_time(d, root, X))
+    return 0 if wait_active(3.0) else 4
+
+
+def _server_time(d, root, X):
+    """A real X server timestamp, or `CurrentTime` (0) if none can be had.
+
+    The server stamps a PropertyNotify with its own time: change a property on
+    a private, never-mapped window of ours and read the time off the event.
+    Nothing else on the display is touched.
+
+    `sync()` is a full round-trip (GetInputFocus): the server generates the
+    PropertyNotify before that reply, and the client reads the event into its
+    queue on the way to the reply. So once `sync()` returns the event is already
+    queued; draining the queue never waits.
+    """
+    try:
+        w = root.create_window(
+            0, 0, 1, 1, 0, X.CopyFromParent, X.InputOutput, X.CopyFromParent,
+            event_mask=X.PropertyChangeMask,
+        )
+    except Exception:
+        return X.CurrentTime
+    try:
+        prop = d.intern_atom("_TINYCTB_TIME")
+        w.change_property(prop, d.intern_atom("STRING"), 8, b"t")
+        d.sync()
+        # Only OUR property's NewValue counts: destroying a window queues a
+        # PropertyDelete for it, and X reuses a freed window id, so a stale
+        # event from an earlier call on the same connection would otherwise
+        # match. Take the newest match.
+        stamp = X.CurrentTime
+        while d.pending_events():
+            ev = d.next_event()
+            if (
+                ev.type == X.PropertyNotify
+                and ev.window.id == w.id
+                and ev.atom == prop
+                and ev.state == X.PropertyNewValue
+            ):
+                stamp = max(stamp, ev.time)
+        return stamp
+    except Exception:
+        return X.CurrentTime
+    finally:
+        try:
+            w.destroy()
+            d.flush()
+        except Exception:
+            pass
 
 
 def _open(target):
