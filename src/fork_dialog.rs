@@ -186,16 +186,18 @@ fn python3_bin() -> PathBuf {
 // interactive session cannot be — its terminal's pty belongs to
 // gnome-terminal, not to a `bg-pty-host` a client can attach. So its native
 // AskUserQuestion selector is driven the way a person at the keyboard would:
-// the daemon remembers which terminal X window the session runs in (captured
-// on each locally typed prompt, rewritten only when it changed) and, on a phone tap, focuses that window
-// and synthesizes the option digit + Return via XTEST. Both helpers are
-// embedded python-xlib scripts, materialized to the cache dir on use exactly
-// like the focus helper.
+// the daemon remembers THAT the session runs in a terminal X window (captured
+// on each locally typed prompt — only a switch since v0.2.19) and, on a phone
+// tap, finds the session's window by a one-off title written through the
+// session's own pts, focuses it and synthesizes the option digit + Return via
+// XTEST. Both helpers are embedded python-xlib scripts, materialized to the
+// cache dir on use exactly like the focus helper.
 
 /// Reads `_NET_ACTIVE_WINDOW` and prints its id iff it is a terminal.
 #[cfg(not(test))]
 const CAPTURE_HELPER_PY: &str = include_str!("capture_window.py");
-/// Focuses a terminal X window and types option digits + Return via XTEST.
+/// Finds the terminal X window showing a title mark, focuses it and types
+/// option digits + Return via XTEST.
 #[cfg(not(test))]
 const XTEST_HELPER_PY: &str = include_str!("xtest_answer.py");
 
@@ -279,20 +281,101 @@ pub(crate) struct XtestGates<'a> {
     pub(crate) release: &'a dyn Fn(),
 }
 
-/// One step of the XTEST helper (`focus` / `digits` / `enter`); `true` on exit 0.
+/// How one helper step ended. `TimedOut` is NOT "nothing happened": the helper
+/// was killed at its deadline (a wedged X server can park Xlib forever), so
+/// for a key step it may or may not have typed — the caller must treat it as
+/// typed (never retry, never follow with Return).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepResult {
+    Done,
+    /// The helper exited non-zero (not 7): by its contract it sent no key.
+    Refused,
+    /// Exit 7: a key MAY have gone out but the sequence did not complete
+    /// cleanly — treat as typed, never retry, never follow with Return.
+    Partial,
+    TimedOut,
+}
+
+/// Hard wall-clock budget per helper step, spawn to exit: the helper's own
+/// waits (find ≤1.5s, focus ≤3s) plus python start-up and slack.
 #[cfg(not(test))]
-fn run_xtest_step(args: &[&str]) -> bool {
+fn step_budget(step: &str) -> Duration {
+    match step {
+        "find" => Duration::from_secs(4),
+        "focus" => Duration::from_secs(6),
+        _ => Duration::from_secs(3),
+    }
+}
+
+/// Run one helper step under [`step_budget`]: poll the child, kill + reap it
+/// at the deadline. Returns the result and the step's stdout (only `find`
+/// prints — a window id, far below any pipe buffer, so reading after exit
+/// cannot deadlock).
+#[cfg(not(test))]
+fn run_helper_bounded(args: &[&str]) -> (StepResult, String) {
+    use std::io::Read as _;
     let Some(helper) = materialize_named_helper("xtest_answer.py", XTEST_HELPER_PY) else {
-        return false;
+        return (StepResult::Refused, String::new());
     };
     let mut cmd = Command::new(python3_bin());
     cmd.arg(&helper)
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     fill_x_env(&mut cmd);
-    matches!(cmd.status(), Ok(status) if status.success())
+    let Ok(mut child) = cmd.spawn() else {
+        return (StepResult::Refused, String::new());
+    };
+    let deadline = std::time::Instant::now() + step_budget(args.first().copied().unwrap_or(""));
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => break None,
+        }
+    };
+    let Some(status) = status else {
+        kill_and_reap(child);
+        return (StepResult::TimedOut, String::new());
+    };
+    let mut out = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut out);
+    }
+    let result = match status.code() {
+        Some(0) => StepResult::Done,
+        Some(7) => StepResult::Partial,
+        _ => StepResult::Refused,
+    };
+    (result, out)
+}
+
+/// SIGKILL a helper and reap it without ever blocking the caller: a child in
+/// uninterruptible sleep (a wedged X socket) can outlive SIGKILL for a while,
+/// and a plain `wait()` would park the daemon on it. Reaped within a short
+/// grace if possible, otherwise by a detached reaper thread.
+#[cfg(not(test))]
+fn kill_and_reap(mut child: std::process::Child) {
+    let _ = child.kill();
+    let grace = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < grace {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
+
+/// One step of the XTEST helper (`focus` / `digits` / `enter`), bounded.
+#[cfg(not(test))]
+fn run_xtest_step(args: &[&str]) -> StepResult {
+    run_helper_bounded(args).0
 }
 
 #[cfg(test)]
@@ -302,52 +385,103 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Test stub: records the step; `TINYCTB_TEST_XTEST` names a step that FAILS
-/// (`focus` / `digits` / `enter`), `delivered` (or unset → nothing reachable)
-/// keeps the old two-value contract for callers that only need an outcome.
+/// Test stub: records each step that is `Done`. `TINYCTB_TEST_XTEST` names a
+/// step that is REFUSED (`push` / `set` / `find` / `focus` / `digits` /
+/// `enter` / `pop`), or `<step>-timeout` / `<step>-partial` for one that
+/// times out / reports a partial sequence; `delivered` lets every step
+/// through, unset / `unreachable` refuses every step.
 #[cfg(test)]
-fn run_xtest_step(args: &[&str]) -> bool {
+fn run_xtest_step(args: &[&str]) -> StepResult {
     let step = args.first().copied().unwrap_or_default();
     let mode = std::env::var("TINYCTB_TEST_XTEST").unwrap_or_default();
-    let ok = match mode.as_str() {
-        "delivered" => true,
-        "" | "unreachable" => false,
-        failing => failing != step,
+    let result = match mode.as_str() {
+        "delivered" => StepResult::Done,
+        "" | "unreachable" => StepResult::Refused,
+        timed if timed.strip_suffix("-timeout") == Some(step) => StepResult::TimedOut,
+        partial if partial.strip_suffix("-partial") == Some(step) => StepResult::Partial,
+        other if other.ends_with("-timeout") || other.ends_with("-partial") => StepResult::Done,
+        failing if failing == step => StepResult::Refused,
+        _ => StepResult::Done,
     };
-    if ok {
+    if result == StepResult::Done {
         XTEST_STEPS.with(|s| s.borrow_mut().push(args.join(" ")));
     }
-    ok
+    result
 }
 
 /// Type option `index` into an interactive session's native selector by
-/// XTEST-ing its 1-based digit, then Return, into terminal X window
-/// `x_window_id`. XTEST types into whatever holds the keyboard focus and we
-/// cannot see the terminal's screen, so every step is fenced by the row:
+/// XTEST-ing its 1-based digit, then Return, into that session's terminal X
+/// window. XTEST types into whatever holds the keyboard focus and we cannot
+/// see the terminal's screen, so every step is fenced — by the row, by the
+/// session's process, and by a TITLE MARK proving which window is the
+/// session's:
 ///
-/// `still_open` → focus (slow, no keys) → `still_open` → `claim` → digits →
-/// beat → `still_ours` → Return.
+/// `still_open` → open the session's pts (proven to be held by the same
+/// process incarnation) → push its title → set a one-off title → find (the
+/// ONE terminal window showing that title) → focus → `still_open` → session
+/// still on that pts → `claim` → digits → beat → `still_ours` + session still
+/// on that pts → Return → pop.
+///
+/// The mark is written through the asking session's OWN pts, so the window
+/// that shows it is the session's window with the session's tab in front —
+/// nothing remembered from the desktop decides where keys go (v0.2.19: a
+/// remembered window captured from the globally active one was another
+/// session's terminal, and a phone tap typed "1⏎" into it). Every key step
+/// re-checks that the window is active AND still shows the mark. The title is
+/// popped through the same open pts on every path once the push went out.
 ///
 /// A revocation before the claim types NOTHING (`Unreachable`, retryable). A
-/// failed digits step sent no key: the claim is released, `Unreachable`. Once a
-/// digit is out the outcome is `Delivered` whatever follows — if the keyboard
-/// answered during the beat (`still_ours` false) the Return is simply withheld.
-/// The PostToolUse hook records the session's own result authoritatively,
-/// whichever surface won. Never `SubmitPending`: single-select, no Submit tab.
+/// refused digits step sent no key: the claim is released, `Unreachable`. Once
+/// a digit may be out — sent, or its step timed out — the outcome is
+/// `Delivered` whatever follows: if the keyboard answered during the beat
+/// (`still_ours` false), the session left its pts, or the digit step timed
+/// out, the Return is simply withheld. The PostToolUse hook records the
+/// session's own result authoritatively, whichever surface won. Never
+/// `SubmitPending`: single-select, no Submit tab.
 pub(crate) fn inject_option_via_xtest(
-    x_window_id: i64,
+    thread_id: &str,
+    terminal: &crate::claude::SessionTerminal,
     index: usize,
     gates: &XtestGates,
 ) -> InjectOutcome {
+    let short = thread_id.get(..8).unwrap_or(thread_id);
     if !(gates.still_open)() {
         return InjectOutcome::Unreachable;
     }
-    let window = x_window_id.to_string();
-    if !run_xtest_step(&["focus", &window]) {
+    let Some(pts) = SessionPts::open(terminal) else {
+        ilog(format!(
+            "xtest {short}: session process left its pts -> Unreachable"
+        ));
+        return InjectOutcome::Unreachable;
+    };
+    let Some(mark) = TitleMark::set(&pts) else {
+        ilog(format!(
+            "xtest {short}: title mark not written -> Unreachable"
+        ));
+        return InjectOutcome::Unreachable;
+    };
+    let Some(window) = run_xtest_find(&mark.text) else {
+        ilog(format!(
+            "xtest {short}: no single terminal window shows the mark -> Unreachable"
+        ));
+        return InjectOutcome::Unreachable;
+    };
+    let window = window.to_string();
+    if run_xtest_step(&["focus", &window, &mark.text]) != StepResult::Done {
+        ilog(format!(
+            "xtest {short}: window {window} not focused -> Unreachable"
+        ));
         return InjectOutcome::Unreachable;
     }
-    // The focus wait is the long step: re-read the row after it.
+    // The focus wait is the long step: re-read the row, and the session's
+    // hold on its pts, after it.
     if !(gates.still_open)() {
+        return InjectOutcome::Unreachable;
+    }
+    if !pts.still_session() {
+        ilog(format!(
+            "xtest {short}: session process left its pts -> Unreachable"
+        ));
         return InjectOutcome::Unreachable;
     }
     // Claim BEFORE the first key; lose the claim → type nothing.
@@ -355,18 +489,226 @@ pub(crate) fn inject_option_via_xtest(
         return InjectOutcome::Unreachable;
     }
     let digits = (index + 1).to_string();
-    if !run_xtest_step(&["digits", &window, &digits]) {
-        // Exit != 0 means NO key was sent (window not active / gone / …).
-        (gates.release)();
-        return InjectOutcome::Unreachable;
+    match run_xtest_step(&["digits", &window, &mark.text, &digits]) {
+        StepResult::Done => {}
+        StepResult::Refused => {
+            // By contract NO key was sent (window not active / mark gone / …).
+            (gates.release)();
+            ilog(format!(
+                "xtest {short}: window {window} lost focus or mark, no key -> Unreachable"
+            ));
+            return InjectOutcome::Unreachable;
+        }
+        incomplete @ (StepResult::Partial | StepResult::TimedOut) => {
+            // A digit may be out. Never retry (it could type twice) and never
+            // submit an answer we cannot vouch for. A KILLED step may have
+            // left the key down: release it (bounded, best-effort).
+            if incomplete == StepResult::TimedOut {
+                let _ = run_xtest_step(&["release", &digits]);
+            }
+            ilog(format!(
+                "xtest {short}: window {window} digit step incomplete ({incomplete:?}), return withheld -> Delivered"
+            ));
+            return InjectOutcome::Delivered;
+        }
     }
     // A person keys "3 ⏎" with a beat; the selector needs it too.
     std::thread::sleep(XTEST_KEY_GAP);
-    // The Return is the key that submits — only while the row is still ours.
-    if (gates.still_ours)() {
-        let _ = run_xtest_step(&["enter", &window]);
-    }
+    // The Return is the key that submits — only while the row is still ours
+    // and the session still sits on the pts that showed the mark.
+    let entered = (gates.still_ours)()
+        && pts.still_session()
+        && match run_xtest_step(&["enter", &window, &mark.text]) {
+            StepResult::Done => true,
+            StepResult::TimedOut => {
+                let _ = run_xtest_step(&["release", &digits]);
+                false
+            }
+            StepResult::Refused | StepResult::Partial => false,
+        };
+    ilog(format!(
+        "xtest {short}: window {window} typed, return {} -> Delivered",
+        if entered { "sent" } else { "withheld" }
+    ));
     InjectOutcome::Delivered
+}
+
+/// The asking session's pts, opened ONCE and proven to be held by the same
+/// process incarnation that asked. Everything written to the terminal — the
+/// title push, the mark, the pop — goes through this one descriptor, so a pts
+/// number recycled to another terminal after the session exits can never be
+/// reached by path (the held descriptor stays bound to the original tty; once
+/// that is hung up, writes merely fail).
+struct SessionPts {
+    #[cfg_attr(test, allow(dead_code))]
+    terminal: crate::claude::SessionTerminal,
+    #[cfg(not(test))]
+    file: std::fs::File,
+}
+
+impl SessionPts {
+    /// `None` unless the recorded process is still the same incarnation and
+    /// holds, on a standard fd, the very device just opened.
+    #[cfg(not(test))]
+    fn open(terminal: &crate::claude::SessionTerminal) -> Option<Self> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Cheap early out before touching the path at all.
+        if crate::claude::process_start_ticks(terminal.pid).as_deref()
+            != Some(terminal.start.as_str())
+        {
+            return None;
+        }
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(&terminal.tty)
+            .ok()?;
+        let pts = Self {
+            terminal: terminal.clone(),
+            file,
+        };
+        pts.still_session().then_some(pts)
+    }
+
+    /// Does the recorded process — the same incarnation, read before AND
+    /// after — still hold the device this descriptor is open on? The process
+    /// was alive across the whole check and kept that pts on its stdio, so the
+    /// pts could not have been freed and recycled in between.
+    #[cfg(not(test))]
+    fn still_session(&self) -> bool {
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+        let pid = self.terminal.pid;
+        let same_incarnation = || {
+            crate::claude::process_start_ticks(pid).as_deref() == Some(self.terminal.start.as_str())
+        };
+        let Ok(ours) = self.file.metadata() else {
+            return false;
+        };
+        if !ours.file_type().is_char_device() || !same_incarnation() {
+            return false;
+        }
+        let held = [0u32, 1, 2].iter().any(|fd| {
+            std::fs::metadata(format!("/proc/{pid}/fd/{fd}"))
+                .is_ok_and(|meta| meta.file_type().is_char_device() && meta.rdev() == ours.rdev())
+        });
+        held && same_incarnation()
+    }
+
+    /// Bounded, non-blocking write of the whole of `bytes` (see
+    /// `approvals::write_bounded`); `false` if any of it did not go out.
+    #[cfg(not(test))]
+    fn write(&self, _step: &str, bytes: &[u8]) -> bool {
+        crate::approvals::write_all_within(&self.file, bytes, Duration::from_millis(300)).is_ok()
+    }
+
+    /// Test stub: `TINYCTB_TEST_SESSION_TERMINAL_NOW` (`pid:start:pts`) is what
+    /// `/proc` shows when the pts is opened — default: exactly the recorded
+    /// terminal; any difference (a recycled pid, another pts) refuses.
+    #[cfg(test)]
+    fn open(terminal: &crate::claude::SessionTerminal) -> Option<Self> {
+        let now = std::env::var("TINYCTB_TEST_SESSION_TERMINAL_NOW")
+            .ok()
+            .and_then(|raw| crate::claude::parse_session_terminal(&raw))
+            .unwrap_or_else(|| terminal.clone());
+        (now == *terminal).then(|| Self {
+            terminal: terminal.clone(),
+        })
+    }
+
+    /// Test stub: `TINYCTB_TEST_SESSION_TERMINAL_LEAVES` = the session left
+    /// its pts after the mark went up.
+    #[cfg(test)]
+    fn still_session(&self) -> bool {
+        std::env::var("TINYCTB_TEST_SESSION_TERMINAL_LEAVES").is_err()
+    }
+
+    /// Test stub: recorded as a step (`push` / `set` / `pop`).
+    #[cfg(test)]
+    fn write(&self, step: &str, _bytes: &[u8]) -> bool {
+        run_xtest_step(&[step]) == StepResult::Done
+    }
+}
+
+/// A one-off title shown by the session's terminal while a phone answer is
+/// typed: pushed (`CSI 22;2 t`), then set (`OSC 2`), through the session's
+/// pts; popped (`CSI 23;2 t`) on drop. The pop is armed the moment the push
+/// is out — a failed set still restores. VTE keeps a title stack, so the pop
+/// restores the session's own title (verified on gnome-terminal 2026-10-09).
+struct TitleMark<'a> {
+    pts: &'a SessionPts,
+    text: String,
+    /// The set may have been cut mid-sequence: the terminal could still be
+    /// inside the OSC string and would swallow the pop as title text, so the
+    /// pop is preceded by CAN, which aborts any sequence in progress.
+    set_incomplete: bool,
+}
+
+impl<'a> TitleMark<'a> {
+    fn set(pts: &'a SessionPts) -> Option<Self> {
+        let text = title_mark_text()?;
+        if !pts.write("push", b"\x1b[22;2t") {
+            // Possibly cut mid-CSI: abort it so the session's next output is
+            // not swallowed as its tail. A complete push would have
+            // succeeded, so there is nothing to pop.
+            let _ = pts.write("cancel", b"\x18");
+            return None;
+        }
+        let mut mark = Self {
+            pts,
+            text,
+            set_incomplete: true,
+        };
+        let set = format!("\x1b]2;{}\x07", mark.text);
+        // On failure `mark` drops here: CAN, then pop.
+        if !pts.write("set", set.as_bytes()) {
+            return None;
+        }
+        mark.set_incomplete = false;
+        Some(mark)
+    }
+}
+
+impl Drop for TitleMark<'_> {
+    fn drop(&mut self) {
+        let written = if self.set_incomplete {
+            self.pts.write("cancel+pop", b"\x18\x1b[23;2t")
+        } else {
+            self.pts.write("pop", b"\x1b[23;2t")
+        };
+        if !written {
+            ilog("xtest: session title not restored (pop not written)".to_string());
+        }
+    }
+}
+
+/// A fresh, unguessable title — unique per tap, so exactly one window can
+/// show it. Fixed in tests so the recorded steps are stable.
+fn title_mark_text() -> Option<String> {
+    #[cfg(test)]
+    return Some("tinyctb-mark".to_string());
+    #[cfg(not(test))]
+    crate::claude::generate_session_uuid().ok().map(|id| {
+        format!(
+            "tinyctb-{}",
+            id.replace('-', "").get(..16).unwrap_or_default()
+        )
+    })
+}
+
+/// The X window showing `mark` as its title, via the helper's bounded `find`
+/// step; `None` if none (or more than one) does, or the step timed out.
+#[cfg(not(test))]
+fn run_xtest_find(mark: &str) -> Option<i64> {
+    match run_helper_bounded(&["find", mark]) {
+        (StepResult::Done, out) => out.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// Test stub: the marked window is always 0x2a526d7 unless `find` fails.
+#[cfg(test)]
+fn run_xtest_find(mark: &str) -> Option<i64> {
+    (run_xtest_step(&["find", mark]) == StepResult::Done).then_some(0x2a526d7)
 }
 
 /// The beat between the option digit and Return (zero in tests).
@@ -2104,15 +2446,23 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// v0.2.17: the interactive XTEST inject is fenced by the row at every step.
+    /// v0.2.17/v0.2.19: the interactive XTEST inject is fenced by the row at
+    /// every step, and finds its window ONLY through the title mark it wrote
+    /// to the session's own pts — popped again on every path after the push.
     #[test]
     fn xtest_inject_is_fenced_by_the_row_at_every_step() {
         let _guard = crate::state::test_env_lock();
         let steps = || XTEST_STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()));
         let released = std::cell::Cell::new(0u32);
+        let terminal = crate::claude::SessionTerminal {
+            pid: 4242,
+            start: "777".to_string(),
+            tty: std::path::PathBuf::from("/dev/pts/99"),
+        };
         let run = |open: &dyn Fn() -> bool, claim: bool, ours: bool| {
             inject_option_via_xtest(
-                0x2a526d7,
+                "sess-xtest",
+                &terminal,
                 2,
                 &XtestGates {
                     still_open: open,
@@ -2122,45 +2472,167 @@ mod tests {
                 },
             )
         };
+        let marked = |tail: &[&str]| {
+            let mut all = vec!["push", "set", "find tinyctb-mark"];
+            all.extend_from_slice(tail);
+            all.push("pop");
+            all.into_iter().map(str::to_string).collect::<Vec<_>>()
+        };
+        const FOCUS: &str = "focus 44377815 tinyctb-mark";
+        const DIGIT: &str = "digits 44377815 tinyctb-mark 3";
+        const ENTER: &str = "enter 44377815 tinyctb-mark";
         std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
         let _ = steps();
 
-        // The whole sequence, in order: focus, digit 3 (index 2), Return.
+        // The whole sequence, in order: push, mark, find, focus, digit 3
+        // (index 2), Return, pop.
         assert_eq!(run(&|| true, true, true), InjectOutcome::Delivered);
-        assert_eq!(
-            steps(),
-            ["focus 44377815", "digits 44377815 3", "enter 44377815"]
-        );
-        // Revoked up front: not even a focus request.
+        assert_eq!(steps(), marked(&[FOCUS, DIGIT, ENTER]));
+        // Revoked up front: not even a push.
         assert_eq!(run(&|| false, true, true), InjectOutcome::Unreachable);
         assert!(steps().is_empty());
-        // Revoked DURING the focus wait (check #1 true, #2 false): focus only.
+        // Revoked DURING the focus wait (check #1 true, #2 false): no key.
         let calls = std::cell::Cell::new(0u32);
         let during = || {
             calls.set(calls.get() + 1);
             calls.get() == 1
         };
         assert_eq!(run(&during, true, true), InjectOutcome::Unreachable);
-        assert_eq!(steps(), ["focus 44377815"]);
+        assert_eq!(steps(), marked(&[FOCUS]));
         // Lost the claim (another tap, or the stamp failed): no key.
         assert_eq!(run(&|| true, false, true), InjectOutcome::Unreachable);
-        assert_eq!(steps(), ["focus 44377815"]);
+        assert_eq!(steps(), marked(&[FOCUS]));
         // Answered at the keyboard during the beat: the digit is out, the
         // Return is WITHHELD, and it is still Delivered (never retryable).
         assert_eq!(run(&|| true, true, false), InjectOutcome::Delivered);
-        assert_eq!(steps(), ["focus 44377815", "digits 44377815 3"]);
+        assert_eq!(steps(), marked(&[FOCUS, DIGIT]));
         assert_eq!(released.get(), 0, "nothing released while keys went out");
 
         // The digits step sent nothing: the claim is released, retryable.
         std::env::set_var("TINYCTB_TEST_XTEST", "digits");
         assert_eq!(run(&|| true, true, true), InjectOutcome::Unreachable);
-        assert_eq!(steps(), ["focus 44377815"]);
+        assert_eq!(steps(), marked(&[FOCUS]));
         assert_eq!(released.get(), 1);
         // A failed Return after the digit is still Delivered.
         std::env::set_var("TINYCTB_TEST_XTEST", "enter");
         assert_eq!(run(&|| true, true, true), InjectOutcome::Delivered);
-        let _ = steps();
+        assert_eq!(steps(), marked(&[FOCUS, DIGIT]));
+        // The digit step was KILLED at its deadline: a digit may be out, so
+        // it is Delivered — never released for a retry, never followed by
+        // Return.
+        std::env::set_var("TINYCTB_TEST_XTEST", "digits-timeout");
+        assert_eq!(run(&|| true, true, true), InjectOutcome::Delivered);
+        assert_eq!(
+            steps(),
+            marked(&[FOCUS, "release 3"]),
+            "a killed key step may have left the key down: released"
+        );
+        assert_eq!(released.get(), 1, "a timed-out digit keeps its claim");
+        // The helper reports a key may be out but the sequence broke: the
+        // same — Delivered, claim kept, no Return (its own finally released).
+        std::env::set_var("TINYCTB_TEST_XTEST", "digits-partial");
+        assert_eq!(run(&|| true, true, true), InjectOutcome::Delivered);
+        assert_eq!(steps(), marked(&[FOCUS]));
+        assert_eq!(released.get(), 1, "a partial digit keeps its claim");
+        // A killed Return: still Delivered, keys released.
+        std::env::set_var("TINYCTB_TEST_XTEST", "enter-timeout");
+        assert_eq!(run(&|| true, true, true), InjectOutcome::Delivered);
+        assert_eq!(steps(), marked(&[FOCUS, DIGIT, "release 3"]));
+        // A wedged find / focus: nothing typed, title popped.
+        std::env::set_var("TINYCTB_TEST_XTEST", "find-timeout");
+        assert_eq!(run(&|| true, true, true), InjectOutcome::Unreachable);
+        assert_eq!(steps(), ["push", "set", "pop"]);
+        std::env::set_var("TINYCTB_TEST_XTEST", "focus-timeout");
+        assert_eq!(run(&|| true, true, true), InjectOutcome::Unreachable);
+        assert_eq!(steps(), marked(&[]));
+        // No window shows the mark (another tab in front, tmux, a terminal
+        // ignoring titles): nothing focused, nothing typed, title popped.
+        std::env::set_var("TINYCTB_TEST_XTEST", "find");
+        assert_eq!(run(&|| true, true, true), InjectOutcome::Unreachable);
+        assert_eq!(steps(), ["push", "set", "pop"]);
+        // The push went out but the mark did not (maybe cut mid-OSC): the
+        // pop is already armed, and is preceded by CAN to abort the string.
+        std::env::set_var("TINYCTB_TEST_XTEST", "set");
+        assert_eq!(run(&|| true, true, true), InjectOutcome::Unreachable);
+        assert_eq!(steps(), ["push", "cancel+pop"]);
+        // The pts would not take the whole push (maybe cut mid-CSI): CAN
+        // aborts the fragment, nothing to pop, nothing else happens at all.
+        std::env::set_var("TINYCTB_TEST_XTEST", "push");
+        assert_eq!(run(&|| true, true, true), InjectOutcome::Unreachable);
+        assert_eq!(steps(), ["cancel"]);
+
+        std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
+        // The pid now belongs to another incarnation (recycled), or the
+        // process sits on another pts: the pts is never even written.
+        for now in [
+            "4242:778:/dev/pts/99",
+            "4242:777:/dev/pts/98",
+            "4243:777:/dev/pts/99",
+        ] {
+            std::env::set_var("TINYCTB_TEST_SESSION_TERMINAL_NOW", now);
+            assert_eq!(
+                run(&|| true, true, true),
+                InjectOutcome::Unreachable,
+                "{now}"
+            );
+            assert!(steps().is_empty(), "{now}");
+        }
+        std::env::remove_var("TINYCTB_TEST_SESSION_TERMINAL_NOW");
+        // The session left its pts after the mark went up: no claim, no key.
+        std::env::set_var("TINYCTB_TEST_SESSION_TERMINAL_LEAVES", "1");
+        assert_eq!(run(&|| true, true, true), InjectOutcome::Unreachable);
+        assert_eq!(steps(), marked(&[FOCUS]));
+        std::env::remove_var("TINYCTB_TEST_SESSION_TERMINAL_LEAVES");
+        assert_eq!(
+            released.get(),
+            1,
+            "no claim was taken after the first release"
+        );
         std::env::remove_var("TINYCTB_TEST_XTEST");
+    }
+
+    /// v0.2.19: the Return is withheld when the session leaves its pts during
+    /// the beat between the digit and Return (the digit is out: Delivered).
+    #[test]
+    fn xtest_withholds_return_when_the_session_leaves_its_pts_after_the_digit() {
+        let _guard = crate::state::test_env_lock();
+        let terminal = crate::claude::SessionTerminal {
+            pid: 4242,
+            start: "777".to_string(),
+            tty: std::path::PathBuf::from("/dev/pts/99"),
+        };
+        std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
+        let _ = XTEST_STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        // still_ours runs right before the Return; the session leaves then.
+        let ours = || {
+            std::env::set_var("TINYCTB_TEST_SESSION_TERMINAL_LEAVES", "1");
+            true
+        };
+        let outcome = inject_option_via_xtest(
+            "sess-xtest",
+            &terminal,
+            0,
+            &XtestGates {
+                still_open: &|| true,
+                claim: &|| true,
+                still_ours: &ours,
+                release: &|| panic!("a digit was sent; nothing may be released"),
+            },
+        );
+        std::env::remove_var("TINYCTB_TEST_SESSION_TERMINAL_LEAVES");
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+        assert_eq!(outcome, InjectOutcome::Delivered);
+        assert_eq!(
+            XTEST_STEPS.with(|s| std::mem::take(&mut *s.borrow_mut())),
+            [
+                "push",
+                "set",
+                "find tinyctb-mark",
+                "focus 44377815 tinyctb-mark",
+                "digits 44377815 tinyctb-mark 1",
+                "pop"
+            ]
+        );
     }
 
     /// v0.2.17: the capture helper's stub returns the remembered window id, and

@@ -2510,7 +2510,7 @@ fn process_exe_path(pid: u32) -> Option<String> {
 /// starttime ticks from `/proc/<pid>/stat` (field 22). Invariant across
 /// `exec` and unique per PID incarnation — the authoritative identity for
 /// the restart-kill check. Linux only.
-fn process_start_ticks(pid: u32) -> Option<String> {
+pub(crate) fn process_start_ticks(pid: u32) -> Option<String> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // comm (field 2) may contain spaces/parens; fields resume after last ')'.
     let rest = stat.rsplit_once(')')?.1;
@@ -3685,6 +3685,59 @@ pub(crate) fn session_tty_path() -> Option<PathBuf> {
     };
     #[cfg(not(test))]
     real_session_tty_path()
+}
+
+/// The Claude Code process a hook belongs to and the pts it runs on — the
+/// identity through which a phone answer finds the session's OWN terminal
+/// window (v0.2.19). Recorded on the question row by the gate; re-verified
+/// by the daemon (`fork_dialog::SessionPts`) before and while it writes to
+/// `tty`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionTerminal {
+    pub(crate) pid: u32,
+    /// starttime ticks of `pid` — a recycled pid is a different process.
+    pub(crate) start: String,
+    pub(crate) tty: PathBuf,
+}
+
+/// This hook's session as a [`SessionTerminal`], or `None` when it has no
+/// pts we could later address (no messaging socket, no `/proc`, stdio not a
+/// pts — tmux and plain terminals all give a pts here). Same route as
+/// [`session_tty_path`], minus the `ps` fallback: XTEST is X11/Linux only.
+pub(crate) fn session_terminal() -> Option<SessionTerminal> {
+    // Tests never read the real session (see `session_tty_path`): unset seam =
+    // none. `pid:start:/dev/pts/N`.
+    #[cfg(test)]
+    return env::var("TINYCTB_TEST_SESSION_TERMINAL")
+        .ok()
+        .and_then(|raw| parse_session_terminal(&raw));
+    #[cfg(not(test))]
+    {
+        let socket = env::var("CLAUDE_CODE_MESSAGING_SOCKET").ok()?;
+        let pid = Path::new(&socket)
+            .file_stem()?
+            .to_str()?
+            .parse::<u32>()
+            .ok()?;
+        observe_session_terminal(pid)
+    }
+}
+
+#[cfg(not(test))]
+fn observe_session_terminal(pid: u32) -> Option<SessionTerminal> {
+    let start = process_start_ticks(pid)?;
+    let tty = proc_fd_tty(pid)?;
+    tty.to_str()?.starts_with("/dev/pts/").then_some(())?;
+    Some(SessionTerminal { pid, start, tty })
+}
+
+#[cfg(test)]
+pub(crate) fn parse_session_terminal(raw: &str) -> Option<SessionTerminal> {
+    let mut parts = raw.splitn(3, ':');
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let start = parts.next()?.to_string();
+    let tty = PathBuf::from(parts.next()?);
+    Some(SessionTerminal { pid, start, tty })
 }
 
 #[cfg(not(test))]

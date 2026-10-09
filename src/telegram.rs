@@ -2789,8 +2789,18 @@ fn inject_native_attach_answer(
     // XTEST-typing the option's digit into its terminal WINDOW — its pty
     // belongs to the terminal emulator, not a `bg-pty-host` a client can
     // attach, so `claude attach` is not an option. `inject_window` set is the
-    // signal; single-select only, so never a batch/Submit path here.
-    if let Some(window) = prompt.inject_window {
+    // signal; single-select only, so never a batch/Submit path here. The
+    // remembered window is NOT the target (v0.2.19): the injector finds the
+    // session's window through a title mark written to the session's own pts,
+    // so a row without that pts (made before v0.2.19) is answered at the PC.
+    if prompt.inject_window.is_some() {
+        let Some(terminal) = prompt.inject_terminal.as_ref() else {
+            return Ok((
+                "没能把答案送进电脑上的对话框，请在电脑窗口作答（未记录）。".to_string(),
+                ApprovalAnswer::Unknown,
+                false,
+            ));
+        };
         // After the claim the row reads `Delivered`, so "still ours" is
         // "not answered / expired / gone" rather than strictly `Open`.
         let still_ours = || {
@@ -2815,7 +2825,12 @@ fn inject_native_attach_answer(
             },
         };
         return Ok(
-            match crate::fork_dialog::inject_option_via_xtest(window, index, &gates) {
+            match crate::fork_dialog::inject_option_via_xtest(
+                &prompt.thread_id,
+                terminal,
+                index,
+                &gates,
+            ) {
                 // Keys reached the terminal. Not an ANSWER — the PostToolUse hook
                 // records the session's own result (whichever surface won). The
                 // row was already stamped delivered by the claim, before any key.
@@ -7990,7 +8005,8 @@ mod tests {
             9_000_000,
         )
         .expect("create");
-        crate::state::mark_question_xtest_window(&conn, "qi1", 0x2a526d7).expect("mark");
+        crate::state::mark_question_xtest_window(&conn, "qi1", 0x2a526d7, &test_terminal())
+            .expect("mark");
 
         std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
         let (toast, outcome, retryable) =
@@ -8031,7 +8047,8 @@ mod tests {
             9_000_000,
         )
         .expect("create");
-        crate::state::mark_question_xtest_window(&conn, "qi2", 0x2a526d7).expect("mark");
+        crate::state::mark_question_xtest_window(&conn, "qi2", 0x2a526d7, &test_terminal())
+            .expect("mark");
 
         std::env::set_var("TINYCTB_TEST_XTEST", "unreachable");
         let (_, outcome, retryable) =
@@ -8044,6 +8061,61 @@ mod tests {
             crate::state::pending_question_status(&conn, "qi2", 2500).expect("status"),
             crate::state::QuestionStatus::Open,
             "row left open for another surface / the hook"
+        );
+    }
+
+    fn test_terminal() -> crate::claude::SessionTerminal {
+        crate::claude::SessionTerminal {
+            pid: 4242,
+            start: "777".to_string(),
+            tty: std::path::PathBuf::from("/dev/pts/99"),
+        }
+    }
+
+    /// v0.2.19: a released row from BEFORE the title mark (a remembered window
+    /// but no session pts) is never typed into — the remembered window alone
+    /// is not proof of anything. Answer at the PC; not retryable, nothing
+    /// claimed, the row stays open for the keyboard.
+    #[test]
+    fn an_interactive_row_without_a_session_pts_is_never_typed_into() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::create_pending_question(
+            &conn,
+            "qi3",
+            "sess-win",
+            "选哪个？",
+            &["Postgres".to_string(), "SQLite".to_string()],
+            false,
+            1000,
+            9_000_000,
+        )
+        .expect("create");
+        conn.execute(
+            "UPDATE pending_questions SET native_attach = 1, inject_window = ?1
+             WHERE question_id = 'qi3'",
+            [0x2a526d7_i64],
+        )
+        .expect("legacy row");
+
+        std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
+        let _ = crate::fork_dialog::XTEST_STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        let (toast, outcome, retryable) =
+            inject_native_attach_answer(&conn, "qi3", "SQLite", 2000).expect("inject");
+        let steps = crate::fork_dialog::XTEST_STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+
+        assert!(toast.contains("请在电脑窗口作答"), "{toast}");
+        assert_eq!(outcome, ApprovalAnswer::Unknown);
+        assert!(!retryable);
+        assert!(
+            steps.is_empty(),
+            "nothing marked, focused or typed: {steps:?}"
+        );
+        assert_eq!(
+            crate::state::pending_question_status(&conn, "qi3", 2500).expect("status"),
+            crate::state::QuestionStatus::Open,
+            "row left open for the keyboard"
         );
     }
 

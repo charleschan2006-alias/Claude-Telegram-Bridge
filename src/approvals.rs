@@ -589,6 +589,13 @@ fn remember_session_window(raw_payload: &str) -> Result<()> {
     if prompt_is_phone_driven(&payload) {
         return Ok(());
     }
+    // Nor does a prompt nobody typed: Claude Code feeds background events
+    // (`<task-notification>`, …) through UserPromptSubmit too, at any moment —
+    // including while the user types in ANOTHER terminal, which is exactly
+    // when "fresh input" vouches for the wrong window.
+    if prompt_is_machine_generated(&payload) {
+        return Ok(());
+    }
     let path = state_db_path()?;
     // A PHONE-driven prompt is not proof of anything about the desktop: the
     // daemon stamps `mark_phone_prompt` BEFORE it writes a phone message into
@@ -634,6 +641,19 @@ fn prompt_is_phone_driven(payload: &Value) -> bool {
         .get("prompt")
         .and_then(Value::as_str)
         .is_some_and(|prompt| prompt.trim_start().starts_with("telegram："))
+}
+
+/// True when this UserPromptSubmit prompt was produced by Claude Code itself,
+/// not typed: its background events arrive wrapped in a tag
+/// (`<task-notification>…`). A typed prompt starting with `<letter` is rare
+/// and merely skips one capture — the next typed prompt captures.
+fn prompt_is_machine_generated(payload: &Value) -> bool {
+    payload
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim_start)
+        .and_then(|prompt| prompt.strip_prefix('<'))
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_alphabetic()))
 }
 
 /// True when the desktop keyboard/pointer stamped `input-activity.json` within
@@ -1362,19 +1382,28 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     // also admits `Unverified` (an unreadable /proc). We only XTEST into a
     // terminal we positively measured to be one; an unverified session with a
     // stale remembered window keeps the held path.
-    let xtest_window = if session_window == crate::claude::SessionWindow::Window
+    //
+    // v0.2.19: the remembered window is only the SWITCH ("this session runs in
+    // an X terminal"). It is captured from the globally active window, which
+    // has been another session's terminal (2026-10-09: a background
+    // task-notification fired the capture while the user typed in a Codex
+    // window, and a phone tap typed "1⏎" into Codex). The TARGET is found at
+    // tap time from the session's own pts (a title mark), so the row also
+    // needs that pts — no pts, no release.
+    let xtest_target = if session_window == crate::claude::SessionWindow::Window
         && !multi_select
         && !options.is_empty()
     {
         crate::state::session_terminal_window(&conn, &thread_id)
             .ok()
             .flatten()
+            .zip(crate::claude::session_terminal())
     } else {
         None
     };
     // Either release path lets the NATIVE selector render (no held banner, the
     // real dialog is the visible surface); only the held path paints a banner.
-    let released = native_attach || xtest_window.is_some();
+    let released = native_attach || xtest_target.is_some();
     // Create the row, mark it native, and settle the fork's older open native
     // rows as ONE transaction: the "at most one open native row per fork"
     // invariant the phone side relies on must be durable, not a window between
@@ -1398,8 +1427,8 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         if native_attach {
             crate::state::mark_question_native_attach(&tx, &question_id)?;
             crate::state::settle_stale_native_questions(&tx, &thread_id, &question_id, now)?;
-        } else if let Some(window) = xtest_window {
-            crate::state::mark_question_xtest_window(&tx, &question_id, window)?;
+        } else if let Some((window, terminal)) = &xtest_target {
+            crate::state::mark_question_xtest_window(&tx, &question_id, *window, terminal)?;
             // An interactive session has AT MOST one live question at a time
             // (the tool blocks its own turn), so normally there is no stale
             // sibling. But if a PRIOR question's PostToolUse settle failed (a
@@ -1487,7 +1516,7 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     // terminal already exists and is rendering the selector. Return no_opinion
     // so that selector stays live for the keyboard, with the phone buttons the
     // other surface (the daemon XTEST-types a tap into this same terminal).
-    if xtest_window.is_some() {
+    if xtest_target.is_some() {
         return Ok(no_opinion());
     }
     let phone_answered = |answer: &str| {
@@ -1876,7 +1905,11 @@ const BANNER_WRITE_BUDGET: Duration = Duration::from_millis(500);
 /// keeps the open from ever adopting the tty as this process's controlling
 /// terminal.
 #[cfg(unix)]
-fn write_bounded(tty: &std::path::Path, bytes: &[u8], budget: Duration) -> std::io::Result<()> {
+pub(crate) fn write_bounded(
+    tty: &std::path::Path,
+    bytes: &[u8],
+    budget: Duration,
+) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let device = std::fs::OpenOptions::new()
         .append(true)
@@ -1892,7 +1925,7 @@ fn write_bounded(tty: &std::path::Path, bytes: &[u8], budget: Duration) -> std::
 /// per-error check while never finishing. `Ok(0)` is an error, not quiet
 /// success — pretending a zero-length write "worked" silently drops the
 /// rest of the banner.
-fn write_all_within<W: std::io::Write>(
+pub(crate) fn write_all_within<W: std::io::Write>(
     mut device: W,
     bytes: &[u8],
     budget: Duration,
@@ -2586,6 +2619,13 @@ mod tests {
                 // dead temp file (or worse, a reused one another test
                 // asserts on).
                 crate::state::EnvVarGuard::clear("TINYCTB_TEST_SESSION_TTY"),
+                // A session whose claude process and pts are known (only
+                // RECORDED by the gate, never written to), so a remembered
+                // window releases; tests that need "no pts" clear it.
+                crate::state::EnvVarGuard::set(
+                    "TINYCTB_TEST_SESSION_TERMINAL",
+                    "4242:777:/dev/pts/99",
+                ),
             ];
             crate::config::write_daemon_config(&DaemonConfig {
                 version: 1,
@@ -4607,6 +4647,19 @@ mod tests {
             Some(0x2a526d7),
             "the remembered window is stamped for XTEST"
         );
+        let (pid, start, tty): (Option<i64>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT inject_pid, inject_pid_start, inject_tty FROM pending_questions
+                 WHERE thread_id = 'sess-q'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("row");
+        assert_eq!(
+            (pid, start.as_deref(), tty.as_deref()),
+            (Some(4242), Some("777"), Some("/dev/pts/99")),
+            "the asking session's process and pts are recorded for the title mark"
+        );
         let pushes: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM outbound_events
@@ -4630,6 +4683,72 @@ mod tests {
         ));
         assert!(!prompt_is_phone_driven(&json!({"prompt": "local text"})));
         assert!(!prompt_is_phone_driven(&json!({"session_id": "s"})));
+    }
+
+    /// v0.2.19: Claude Code's own background events (a Monitor expiring, a
+    /// task finishing) arrive tag-wrapped through UserPromptSubmit and must
+    /// not capture a window; typed text, a slash command, or a bare `<` does.
+    #[test]
+    fn a_machine_generated_prompt_is_recognised_by_its_tag() {
+        assert!(prompt_is_machine_generated(&json!({
+            "prompt": "<task-notification>\n<task-id>b1</task-id>"
+        })));
+        assert!(prompt_is_machine_generated(
+            &json!({"prompt": "  <teammate-message x>"})
+        ));
+        assert!(!prompt_is_machine_generated(&json!({"prompt": "继续"})));
+        assert!(!prompt_is_machine_generated(&json!({"prompt": "/review"})));
+        assert!(!prompt_is_machine_generated(
+            &json!({"prompt": "< 3 是对的"})
+        ));
+        assert!(!prompt_is_machine_generated(&json!({"session_id": "s"})));
+    }
+
+    /// v0.2.19 guard: a remembered window is only a switch. Without the
+    /// session's own pts there is no way to find its window at tap time, so
+    /// the question keeps the HELD path (the phone fills it) instead of being
+    /// released to a selector the phone could never type into.
+    #[test]
+    fn a_window_session_without_a_known_pts_still_holds() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("no-pts-holds", true, 120);
+        let _terminal = crate::state::EnvVarGuard::clear("TINYCTB_TEST_SESSION_TERMINAL");
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        crate::state::set_session_terminal_window(&conn, "sess-q", 0x2a526d7, 1000)
+            .expect("seed window");
+        drop(conn);
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(800));
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            let id: String = conn
+                .query_row(
+                    "SELECT question_id FROM pending_questions WHERE thread_id = 'sess-q'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("question row");
+            crate::state::record_question_answer(&conn, &id, "Postgres", 2000).expect("tap");
+        });
+        let result = question_gate(question_payload());
+        writer.join().expect("writer");
+
+        assert!(
+            result["systemMessage"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("已由手机作答"),
+            "no pts keeps the held path: {result}"
+        );
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let inject_window: Option<i64> = conn
+            .query_row(
+                "SELECT inject_window FROM pending_questions WHERE thread_id = 'sess-q'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("row");
+        assert_eq!(inject_window, None, "never marked for XTEST");
     }
 
     /// v0.2.17 guard: a Window session with NO remembered window keeps the

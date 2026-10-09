@@ -945,6 +945,14 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     // XTEST-typed. NULL for a held row and for a background fork's attach row
     // (the phone side reads this to pick XTEST vs `claude attach`).
     ensure_column(conn, "pending_questions", "inject_window", "INTEGER")?;
+    // v0.2.19: the asking session's claude pid, its starttime ticks and its
+    // pts. The phone side writes a one-off title mark through that pts and
+    // types only into the X window showing it — the remembered window above
+    // is a switch, never the target. NULL on a row from before this, which a
+    // tap then refuses (answer at the PC).
+    ensure_column(conn, "pending_questions", "inject_pid", "INTEGER")?;
+    ensure_column(conn, "pending_questions", "inject_pid_start", "TEXT")?;
+    ensure_column(conn, "pending_questions", "inject_tty", "TEXT")?;
     ensure_column(conn, "pending_prompts", "transcript_bytes", "INTEGER")?;
     ensure_column(conn, "pending_prompts", "notification_type", "TEXT")?;
     // WHICH INSTANCE of a prompt this row is. The id is `notify:{received_at}`
@@ -3763,11 +3771,19 @@ pub(crate) fn mark_question_xtest_window(
     conn: &Connection,
     question_id: &str,
     x_window_id: i64,
+    terminal: &crate::claude::SessionTerminal,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE pending_questions SET native_attach = 1, inject_window = ?2
+        "UPDATE pending_questions SET native_attach = 1, inject_window = ?2,
+           inject_pid = ?3, inject_pid_start = ?4, inject_tty = ?5
          WHERE question_id = ?1",
-        params![question_id, x_window_id],
+        params![
+            question_id,
+            x_window_id,
+            i64::from(terminal.pid),
+            terminal.start,
+            terminal.tty.to_string_lossy()
+        ],
     )?;
     Ok(())
 }
@@ -4081,6 +4097,10 @@ pub(crate) struct QuestionPrompt {
     /// injected through a `claude attach` client. `None` for a fork's attach
     /// row (and for held rows, which are never routed here at all).
     pub(crate) inject_window: Option<i64>,
+    /// The asking session's process and pts (v0.2.19) — how the phone side
+    /// finds the session's window by a title mark. `None` on a row that
+    /// predates it (or a fork's attach row).
+    pub(crate) inject_terminal: Option<crate::claude::SessionTerminal>,
 }
 
 pub(crate) fn question_prompt(
@@ -4095,13 +4115,26 @@ pub(crate) fn question_prompt(
         Option<i64>,
         Option<i64>,
         Option<i64>,
+        Option<crate::claude::SessionTerminal>,
     );
     let row: Option<PromptRow> = conn
         .query_row(
-            "SELECT thread_id, options_json, native_attach, batch_seq, batch_total, delivered_at, inject_window
+            "SELECT thread_id, options_json, native_attach, batch_seq, batch_total, delivered_at, inject_window,
+                    inject_pid, inject_pid_start, inject_tty
              FROM pending_questions WHERE question_id = ?1",
             params![question_id],
             |row| {
+                let pid: Option<i64> = row.get(7)?;
+                let start: Option<String> = row.get(8)?;
+                let tty: Option<String> = row.get(9)?;
+                let terminal = match (pid.and_then(|p| u32::try_from(p).ok()), start, tty) {
+                    (Some(pid), Some(start), Some(tty)) => Some(crate::claude::SessionTerminal {
+                        pid,
+                        start,
+                        tty: std::path::PathBuf::from(tty),
+                    }),
+                    _ => None,
+                };
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -4110,12 +4143,22 @@ pub(crate) fn question_prompt(
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    terminal,
                 ))
             },
         )
         .optional()?;
     Ok(row.map(
-        |(thread_id, options_json, native, seq, total, _delivered_at, inject_window)| {
+        |(
+            thread_id,
+            options_json,
+            native,
+            seq,
+            total,
+            _delivered_at,
+            inject_window,
+            inject_terminal,
+        )| {
             QuestionPrompt {
                 thread_id,
                 options: serde_json::from_str::<Vec<String>>(&options_json).unwrap_or_default(),
@@ -4132,6 +4175,7 @@ pub(crate) fn question_prompt(
                     _ => None,
                 },
                 inject_window,
+                inject_terminal,
             }
         },
     ))
@@ -9718,11 +9762,22 @@ mod tests {
         let before = question_prompt(&conn, "qx").expect("read").expect("row");
         assert!(!before.native_attach);
         assert_eq!(before.inject_window, None);
+        assert_eq!(before.inject_terminal, None);
 
-        mark_question_xtest_window(&conn, "qx", 0x2a526d7).expect("mark");
+        let terminal = crate::claude::SessionTerminal {
+            pid: 4242,
+            start: "777".to_string(),
+            tty: std::path::PathBuf::from("/dev/pts/9"),
+        };
+        mark_question_xtest_window(&conn, "qx", 0x2a526d7, &terminal).expect("mark");
         let after = question_prompt(&conn, "qx").expect("read").expect("row");
         assert!(after.native_attach, "phone routes through native-attach");
-        assert_eq!(after.inject_window, Some(0x2a526d7), "XTEST target window");
+        assert_eq!(after.inject_window, Some(0x2a526d7), "XTEST switch window");
+        assert_eq!(
+            after.inject_terminal,
+            Some(terminal),
+            "the asking session's pid / starttime / pts round-trip"
+        );
         assert_eq!(
             after.batch, None,
             "a single interactive question is not a batch"

@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
-"""tinyCTB XTEST helper: focus a terminal window, then type an option + Return.
+"""tinyCTB XTEST helper: find, focus a terminal window, then type an option + Return.
 
-Three small steps, invoked separately so the CALLER can re-check the DB row
-between every one of them (the answer may be given at the keyboard at any time):
+Small steps, invoked separately so the CALLER can re-check the DB row between
+every one of them (the answer may be given at the keyboard at any time).
 
-  xtest_answer.py focus  <x_window_id>
+<mark> is a one-off title the caller has just written through the asking
+session's OWN pts (`OSC 2`). Only the session's terminal window — with the
+session's tab in front — can show it, so it is the window's identity: `find`
+locates the window by it, and every later step refuses to act unless the
+window STILL shows it. Nothing remembered from the desktop decides where keys
+go (a window captured from "whatever was active" once was another session's
+terminal, and the keys went there — 2026-10-09).
+
+  xtest_answer.py find <mark>
+      Print the id of the ONE terminal window whose title is exactly <mark>,
+      waiting up to ~1.5s for the terminal to apply it. None, or more than one:
+      print nothing, exit 4 / 5.
+
+  xtest_answer.py focus  <x_window_id> <mark>
       Send an EWMH `_NET_ACTIVE_WINDOW` ClientMessage with source=2 (which Mutter
       honours as a direct user request) and a REAL server timestamp, and wait up
       to ~3s for the focus to land. The only slow step; sends no keys.
@@ -21,12 +34,18 @@ between every one of them (the answer may be given at the keyboard at any time):
       under load the focus was seen to land after more than 2s. Total: one X
       round-trip for the timestamp plus at most 3s of polling (monotonic clock).
 
-  xtest_answer.py digits <x_window_id> <digits>
+  xtest_answer.py digits <x_window_id> <mark> <digits>
       Type the option digit(s). Never waits, never re-focuses: if the window is
-      not the active one right now, nothing is typed (exit 4).
+      not the active one right now, or no longer shows <mark>, nothing is typed
+      (exit 4 / 6). Both are re-checked before EVERY key.
 
-  xtest_answer.py enter  <x_window_id>
+  xtest_answer.py enter  <x_window_id> <mark>
       Type Return — the one key that SUBMITS — under the same rule.
+
+  xtest_answer.py release <digits>
+      Best-effort KeyRelease of those digit keys and Return, nothing else. The
+      caller runs it after it had to KILL a key step at its deadline, which may
+      have left a key pressed (an auto-repeating key would keep typing).
 
 A window is a terminal iff its WM_CLASS contains b"term" (case-insensitively:
 gnome-terminal, xterm, terminator, …). Both phases re-check it so keys never
@@ -37,10 +56,17 @@ inject use the same $DISPLAY), and a US-style layout where option digits are
 unshifted. Multi-display or shifted-digit layouts fall outside this helper.
 
 Exit codes:
-  0  ok (focused, or at least one key handed to the server)
+  0  ok (find: printed the window; focus: focused and still marked; keys: EVERY
+     key pressed and released)
   2  bad arguments / no keycode for a required keysym
   3  the window is gone or is no longer a terminal
-  4  the window is not the active one (focus: not in time; keys: right now)
+  4  the window is not the active one (focus: not in time; keys: right now);
+     find: no window shows the mark in time
+  5  find: more than one window shows the mark
+  6  the window no longer shows the mark (focus: at any point of its wait)
+  7  keys: at least one key MAY have gone out, but not the whole sequence
+     cleanly (focus / mark lost after it, or an error after a press) — never
+     retry, never follow with Return; any key left down is released first
   1  any other failure before the first key (no Xlib, no XTEST, …)
 
 Whoever answers first wins: the caller only types after re-confirming the row is
@@ -58,7 +84,53 @@ def _is_terminal(win, WC, X):
     return b"term" in val.lower()
 
 
-def do_focus(target):
+def _shows_mark(d, win, X, mark):
+    """True iff the window's title is exactly `mark` (EWMH name, else WM_NAME)."""
+    want = mark.encode("utf-8")
+    for name in ("_NET_WM_NAME", "WM_NAME"):
+        p = win.get_full_property(d.intern_atom(name), X.AnyPropertyType)
+        if p is not None:
+            val = p.value
+            raw = val.encode("utf-8") if isinstance(val, str) else bytes(val)
+            return raw == want
+    return False
+
+
+def do_find(mark):
+    from Xlib import display, X
+
+    d = display.Display()
+    root = d.screen().root
+    CL = d.intern_atom("_NET_CLIENT_LIST")
+    WC = d.intern_atom("WM_CLASS")
+
+    def marked():
+        p = root.get_full_property(CL, X.AnyPropertyType)
+        found = []
+        for wid in (int(w) for w in p.value) if p and p.value else []:
+            try:
+                win = d.create_resource_object("window", wid)
+                if _is_terminal(win, WC, X) and _shows_mark(d, win, X, mark):
+                    found.append(wid)
+            except Exception:
+                continue  # a window that vanished mid-scan is not ours
+        return found
+
+    deadline = time.monotonic() + 1.5
+    while True:
+        found = marked()
+        if len(found) == 1:
+            sys.stdout.write(str(found[0]))
+            sys.stdout.flush()
+            return 0
+        if len(found) > 1:
+            return 5
+        if time.monotonic() >= deadline:
+            return 4
+        time.sleep(0.03)
+
+
+def do_focus(target, mark):
     from Xlib import display, X, protocol
 
     d = display.Display()
@@ -80,6 +152,8 @@ def do_focus(target):
     win = d.create_resource_object("window", target)
     if not _is_terminal(win, WC, X):
         return 3
+    if not _shows_mark(d, win, X, mark):
+        return 6
 
     def activate(timestamp):
         # data.l[0]=2: source is a pager / direct user action; l[1]: a real
@@ -93,15 +167,21 @@ def do_focus(target):
         d.flush()
 
     def wait_active(seconds):
+        # The mark is re-read on EVERY poll and once more on success: another
+        # tab brought to the front during the wait retitles the window, and
+        # focusing it then would be focusing someone else's tab.
         deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
+        while True:
+            if not _shows_mark(d, win, X, mark):
+                return 6
             if active() == target:
-                return True
+                return 0 if _shows_mark(d, win, X, mark) else 6
+            if time.monotonic() >= deadline:
+                return 4
             time.sleep(0.05)
-        return active() == target
 
     activate(_server_time(d, root, X))
-    return 0 if wait_active(3.0) else 4
+    return wait_active(3.0)
 
 
 def _server_time(d, root, X):
@@ -152,8 +232,8 @@ def _server_time(d, root, X):
             pass
 
 
-def _open(target):
-    """Connect and validate: returns (d, X, active) or an exit code."""
+def _open(target, mark):
+    """Connect and validate: returns (d, X, active, marked) or an exit code."""
     from Xlib import display, X
 
     d = display.Display()
@@ -175,52 +255,88 @@ def _open(target):
         q = root.get_full_property(AW, X.AnyPropertyType)
         return int(q.value[0]) if q and q.value else None
 
-    return d, X, active
+    def marked():
+        return _shows_mark(d, win, X, mark)
+
+    return d, X, active, marked
 
 
-def do_keys(target, keysyms):
-    """Send `keysyms` to the focused window, which MUST be `target`.
+def do_keys(target, mark, keysyms):
+    """Send `keysyms` to the focused window, which MUST be `target` showing `mark`.
 
     XTEST fake_input has no target-window argument — it types into whatever
     holds the keyboard focus. So this never waits and never re-focuses: the
     caller focused the window in the `focus` phase and re-checked its own
-    authorization since; if the window is not active NOW, nothing is typed (4)
-    and the caller decides. The active window is re-checked before EVERY key.
+    authorization since; if the window is not active NOW (4), or no longer
+    shows the mark — another tab came to the front, the session retitled — (6),
+    nothing more is typed and the caller decides. Both are re-checked before
+    EVERY key.
 
     NO keyboard grab, deliberately: an active XGrabKeyboard delivers key events
     — XTEST's synthetic ones included — to the GRABBING client (this script),
     not to the terminal that owns the window, so it would swallow these keys.
 
-    Returns 0 once ANY key has been handed to the server (a later failure must
-    not read as "nothing typed / retryable" — a retry would type again), and a
-    non-zero code only when NO key was sent.
+    Returns 0 only when EVERY key was pressed and released; 7 once any key
+    MAY have reached the server without the whole sequence completing (a
+    later failure must not read as "nothing typed / retryable" — a retry would
+    type again — nor as success, which would let a Return submit a prefix);
+    and 4 / 6 / 1 only when NO key was sent. A key left down by an error is
+    released before returning.
     """
     from Xlib.ext import xtest
 
-    opened = _open(target)
+    opened = _open(target, mark)
     if isinstance(opened, int):
         return opened
-    d, X, active = opened
+    d, X, active, marked = opened
     # Validate every keycode BEFORE emitting any key. NOTE: digits are typed by
     # their UNSHIFTED keycode — a US-style-layout assumption of this deployment.
     keycodes = [d.keysym_to_keycode(ks) for ks in keysyms]
     if any(kc == 0 for kc in keycodes):
         return 2
     started = False
+    down = None
     try:
         for kc in keycodes:
             if active() != target:
-                return 0 if started else 4
-            xtest.fake_input(d, X.KeyPress, kc)
+                return 7 if started else 4
+            if not marked():
+                return 7 if started else 6
+            # Flagged BEFORE the request: a raise inside fake_input may still
+            # have queued the press.
             started = True
+            down = kc
+            xtest.fake_input(d, X.KeyPress, kc)
             d.sync()
             time.sleep(0.05)
             xtest.fake_input(d, X.KeyRelease, kc)
             d.sync()
+            down = None
             time.sleep(0.05)
         return 0
     except Exception:
-        return 0 if started else 1
+        return 7 if started else 1
+    finally:
+        if down is not None:
+            try:
+                xtest.fake_input(d, X.KeyRelease, down)
+                d.sync()
+            except Exception:
+                pass
+
+
+def do_release(keysyms):
+    """KeyRelease each keysym's key; releasing a key that is up is a no-op."""
+    from Xlib import display, X
+    from Xlib.ext import xtest
+
+    d = display.Display()
+    for ks in keysyms:
+        kc = d.keysym_to_keycode(ks)
+        if kc:
+            xtest.fake_input(d, X.KeyRelease, kc)
+    d.sync()
+    return 0
 
 
 def main(argv):
@@ -228,21 +344,32 @@ def main(argv):
         return 2
     mode = argv[1]
     try:
+        if mode == "find" and len(argv) == 3:
+            return do_find(argv[2]) if argv[2] else 2
+        if mode == "release" and len(argv) == 3:
+            if not argv[2] or not all(ch.isdigit() for ch in argv[2]):
+                return 2
+            from Xlib import XK
+
+            return do_release([XK.string_to_keysym(ch) for ch in argv[2]] + [XK.XK_Return])
+        if len(argv) < 4 or not argv[3]:
+            return 2
         target = int(argv[2])
+        mark = argv[3]
     except Exception:
         return 2
     try:
         from Xlib import XK
 
-        if mode == "focus" and len(argv) == 3:
-            return do_focus(target)
-        if mode == "digits" and len(argv) == 4:
-            digits = argv[3]
+        if mode == "focus" and len(argv) == 4:
+            return do_focus(target, mark)
+        if mode == "digits" and len(argv) == 5:
+            digits = argv[4]
             if not digits or not all(ch.isdigit() for ch in digits):
                 return 2
-            return do_keys(target, [XK.string_to_keysym(ch) for ch in digits])
-        if mode == "enter" and len(argv) == 3:
-            return do_keys(target, [XK.XK_Return])
+            return do_keys(target, mark, [XK.string_to_keysym(ch) for ch in digits])
+        if mode == "enter" and len(argv) == 4:
+            return do_keys(target, mark, [XK.XK_Return])
         return 2
     except Exception:
         return 1
