@@ -1337,8 +1337,11 @@ fn write_listener_heartbeat(dir: &Path, now_ms: u64, up_since_ms: u64, idle: boo
 /// One write per this interval is plenty: the gates compare against a 15s
 /// window, and a burst of typing would otherwise rewrite the file per key.
 const INPUT_ACTIVITY_MIN_GAP: Duration = Duration::from_millis(1000);
-/// How long a watcher waits before reconnecting to its own candidate.
-const INPUT_LISTENER_RETRY: Duration = Duration::from_secs(5);
+/// How long a watcher waits before reconnecting to its own candidate. Short
+/// (v0.2.21): until the listener is up, 电脑优先 cannot prove the keyboard
+/// untouched, so a batch asked in the gap after a daemon restart was handed
+/// to the PC at once — a 5s retry let the gap reach ~25s.
+const INPUT_LISTENER_RETRY: Duration = Duration::from_secs(1);
 /// How often the supervisor re-scans for X sessions appearing or vanishing.
 const INPUT_LISTENER_RESCAN: Duration = Duration::from_secs(30);
 
@@ -1616,7 +1619,18 @@ fn spawn_worker(
                 busy: Arc::clone(&busy),
                 clock: Arc::clone(&clock),
             };
+            let connected_at = Instant::now();
+            #[cfg(not(test))]
+            eprintln!("tinyctb: keyboard listener connected ({})", candidate.0);
             record_keypresses(reader, &dir, &publisher, min_gap, &|| clock());
+            #[cfg(not(test))]
+            eprintln!(
+                "tinyctb: keyboard listener stream ended after {:?} ({})",
+                connected_at.elapsed(),
+                candidate.0
+            );
+            #[cfg(test)]
+            let _ = connected_at;
             {
                 let mut live = connected.lock().unwrap_or_else(|p| p.into_inner());
                 *live = false;
@@ -5281,7 +5295,7 @@ mod tests {
                 Arc::clone(&publisher),
                 Duration::from_millis(0),
                 Arc::new(|| 1),
-                INPUT_LISTENER_RETRY, // the production 5s
+                Duration::from_secs(5), // a long gap, so the cancel must interrupt it
             )
         };
         let a = (":a".to_string(), None);

@@ -3665,7 +3665,9 @@ pub(crate) fn finalize_settled_question_messages(
     let deadline = std::time::Instant::now() + FINALIZE_WAKE_BUDGET;
     let call_timeout = || {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
-        (!left.is_zero()).then(|| left.min(timeout).min(FINALIZE_CALL_TIMEOUT))
+        // Less than one agent step (250ms, `api::shared_agent`) left: stop
+        // rather than start a call that would round up past the budget.
+        (left >= Duration::from_millis(250)).then(|| left.min(timeout).min(FINALIZE_CALL_TIMEOUT))
     };
     // One call: `Some(true)` closed (or can never be), `Some(false)` a
     // transient failure, `None` out of budget (not attempted).

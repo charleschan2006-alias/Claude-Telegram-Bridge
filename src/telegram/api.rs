@@ -12,10 +12,17 @@ fn shared_agent(timeout: Duration) -> ureq::Agent {
     use std::collections::HashMap;
     use std::sync::Mutex;
     static AGENTS: Mutex<Option<HashMap<u128, ureq::Agent>>> = Mutex::new(None);
+    // One agent per timeout VALUE, cached forever — so the value is rounded
+    // up to a 250ms step (v0.2.21): a caller passing "what is left of a
+    // budget" would otherwise mint a new agent (and a fresh TLS connection)
+    // for every distinct millisecond count, growing the cache without bound.
+    let step = 250u128;
+    let rounded = timeout.as_millis().div_ceil(step).max(1) * step;
+    let timeout = Duration::from_millis(u64::try_from(rounded).unwrap_or(u64::MAX));
     let mut agents = AGENTS.lock().expect("agent cache lock");
     let agents = agents.get_or_insert_with(HashMap::new);
     agents
-        .entry(timeout.as_millis())
+        .entry(rounded)
         .or_insert_with(|| {
             ureq::Agent::config_builder()
                 .timeout_global(Some(timeout))
