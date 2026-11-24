@@ -1015,6 +1015,137 @@ fn enqueue_sync_error_notification(
     Ok((events, enqueued))
 }
 
+/// Is this cycle result worth a log line? Anything observed, enqueued,
+/// delivered, attempted, answered, received from Telegram, or any failure.
+fn cycle_is_noteworthy(result: &Value) -> bool {
+    let count = |pointer: &str| result.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
+    let failed = |pointer: &str| {
+        result
+            .pointer(pointer)
+            .and_then(|lane| lane.get("ok"))
+            .and_then(Value::as_bool)
+            == Some(false)
+    };
+    result.get("ok").and_then(Value::as_bool) == Some(false)
+        || [
+            "/enqueued",
+            "/observed",
+            "/delivery/attempted",
+            "/delivery/delivered",
+            "/delivery/failed",
+            "/bridgeTurns/answered",
+            "/bridgeTurns/failed",
+            "/telegramUpdates/seen",
+            "/telegramUpdates/failed",
+        ]
+        .iter()
+        .any(|pointer| count(pointer) > 0)
+        || failed("/telegramUpdates")
+        || failed("/bridgeTurns")
+}
+
+/// When a daemon log (its stdout / stderr file) passes this size, its last
+/// [`DAEMON_LOG_KEEP_BYTES`] are kept as `<name>.1` and it starts over.
+const DAEMON_LOG_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const DAEMON_LOG_KEEP_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Rotate the daemon's own stdout / stderr log files (v0.2.24). systemd opens
+/// them in append mode and hands over the descriptors, so the daemon cannot
+/// reopen them; it copies the tail aside and truncates the descriptor in
+/// place (with O_APPEND the next line lands at the new start). Only regular
+/// files — a terminal or pipe (a manual run) is left alone.
+fn rotate_daemon_logs() {
+    let Ok(logs_dir) = state_dir_path().map(|dir| dir.join("logs")) else {
+        return;
+    };
+    let own = [
+        logs_dir.join("daemon.out.log"),
+        logs_dir.join("daemon.err.log"),
+    ];
+    for fd in [1, 2] {
+        if let Err(error) = rotate_log_fd(fd, &own, DAEMON_LOG_MAX_BYTES, DAEMON_LOG_KEEP_BYTES) {
+            // Never panic on a failed stderr write (a full disk).
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "tinyctb: log rotation of fd {fd} failed: {error:#}"
+            );
+        }
+    }
+}
+
+/// Rotate `fd`'s file — only if it is one of `own` (Sol v0.2.24 r2): the
+/// logs the service unit points at (`daemon_service_spec`). A daemon run by
+/// hand into some shared file (`>> app.log`) never truncates it.
+fn rotate_log_fd(fd: i32, own: &[PathBuf], max_bytes: u64, keep_bytes: u64) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::FromRawFd;
+    // Borrow the descriptor without ever closing it.
+    let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() <= max_bytes {
+        return Ok(false);
+    }
+    let path = std::fs::read_link(format!("/proc/self/fd/{fd}"))?;
+    // Compared canonically by DIRECTORY only: the descriptor's path is
+    // resolved and our state directory may be a symlink, but the log file
+    // itself must be a real file with our name (Sol v0.2.24 r3) — a
+    // `daemon.out.log` symlinked to some shared log is not ours to cut.
+    let ours = own.iter().any(|candidate| {
+        let (Some(parent), Some(name)) = (candidate.parent(), candidate.file_name()) else {
+            return false;
+        };
+        std::fs::symlink_metadata(candidate).is_ok_and(|meta| meta.file_type().is_file())
+            && std::fs::canonicalize(parent).is_ok_and(|dir| dir.join(name) == path)
+    });
+    if path.to_string_lossy().ends_with(" (deleted)") || !ours {
+        return Ok(false);
+    }
+    let mut rotated = path.clone().into_os_string();
+    rotated.push(".1");
+    let mut staged = path.clone().into_os_string();
+    staged.push(".1.tmp");
+    // Keep the tail (from a line boundary) as `.1`. If that fails — a full
+    // disk is the likely cause (Sol v0.2.24 r4) — drop the partial copy and
+    // truncate ANYWAY: freeing the space matters more than the history, and
+    // keeping the log would hit the same wall every sweep.
+    let archive = || -> Result<()> {
+        let mut reader = std::fs::File::open(&path)?;
+        let start = meta.len().saturating_sub(keep_bytes);
+        reader.seek(SeekFrom::Start(start))?;
+        let mut tail = Vec::new();
+        reader.read_to_end(&mut tail)?;
+        let tail = match (start > 0, tail.iter().position(|b| *b == b'\n')) {
+            (true, Some(newline)) => &tail[newline + 1..],
+            _ => &tail[..],
+        };
+        let mut out = std::fs::File::create(&staged)?;
+        out.write_all(tail)?;
+        drop(out);
+        std::fs::rename(&staged, &rotated)?;
+        Ok(())
+    };
+    let archived = archive();
+    if archived.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    file.set_len(0)?;
+    // Back to the start too (Sol v0.2.24 r1): a plain `>` redirect (no
+    // O_APPEND) keeps its old offset after the truncation, and the next
+    // line would land past a hole of zeros. Harmless under O_APPEND.
+    (&*file).seek(SeekFrom::Start(0))?;
+    // Said only AFTER the truncation, and without `eprintln!` (Sol v0.2.24
+    // r5): on a full disk the stderr write itself can fail, and `eprintln!`
+    // would panic before the space was freed.
+    if let Err(error) = archived {
+        let _ = writeln!(
+            std::io::stderr(),
+            "tinyctb: could not keep the tail of {path:?} ({error:#}); truncated anyway"
+        );
+    }
+    Ok(true)
+}
+
 /// Which lanes a wake runs. The 500ms base tick must stay CHEAP: the full
 /// transcript sync (parsing up to 50 session files) and the Telegram
 /// getUpdates HTTP round trip cannot run on every tick — the first for CPU,
@@ -2086,6 +2217,7 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
             }
         };
         if now.saturating_sub(last_prune_at) >= DAEMON_PRUNE_INTERVAL_MS {
+            rotate_daemon_logs();
             match prune_state_logs(&conn, now) {
                 Ok(removed) => {
                     println!(
@@ -2133,18 +2265,10 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
                 {
                     last_phone_activity_at = now;
                 }
-                let noteworthy = lanes.full_sync
-                    || result.get("enqueued").and_then(Value::as_u64).unwrap_or(0) > 0
-                    || result
-                        .pointer("/delivery/delivered")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
-                        > 0
-                    || result
-                        .pointer("/bridgeTurns/answered")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
-                        > 0;
+                // Only cycles where something HAPPENED (v0.2.24): an idle
+                // full-sync line every 1.5s was ~25MB a day of nothing and
+                // grew the log to 1.9GB.
+                let noteworthy = cycle_is_noteworthy(&result);
                 if noteworthy {
                     println!("{}", result);
                 }
@@ -5618,6 +5742,93 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// v0.2.24: a log past its cap keeps its last lines as `.1` (from a line
+    /// boundary) and starts over; the append descriptor writes at the new
+    /// start; a small log or a non-file is left alone.
+    #[test]
+    fn a_big_daemon_log_is_rotated_in_place() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let dir = temp_dir("log-rotate");
+        let path = dir.join("daemon.out.log");
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open");
+        for i in 0..100 {
+            writeln!(log, "line {i:03}").expect("write");
+        }
+        let fd = log.as_raw_fd();
+        let own = vec![path.clone(), dir.join("plain.log")];
+        assert!(
+            !rotate_log_fd(fd, &own, 10_000, 30).expect("small"),
+            "under the cap"
+        );
+        assert!(
+            !rotate_log_fd(fd, &[dir.join("other.log")], 500, 30).expect("not ours"),
+            "a file that is not one of our logs is never touched"
+        );
+        // Sol v0.2.24 r3: our log NAME symlinked to some shared file is not ours.
+        let link = dir.join("link-dir");
+        fs::create_dir_all(&link).expect("dir");
+        std::os::unix::fs::symlink(&path, link.join("daemon.out.log")).expect("symlink");
+        assert!(
+            !rotate_log_fd(fd, &[link.join("daemon.out.log")], 500, 30).expect("symlinked"),
+            "a symlinked log file is never truncated"
+        );
+        assert!(rotate_log_fd(fd, &own, 500, 30).expect("rotate"));
+        let kept = fs::read_to_string(dir.join("daemon.out.log.1")).expect("kept");
+        assert!(kept.starts_with("line 09"), "{kept:?}");
+        assert!(kept.ends_with("line 099\n"), "{kept:?}");
+        assert_eq!(fs::metadata(&path).expect("meta").len(), 0);
+        writeln!(log, "after").expect("write after");
+        assert_eq!(fs::read_to_string(&path).expect("read"), "after\n");
+        // A plain `>` redirect (no O_APPEND) also writes at the new start.
+        let plain_path = dir.join("plain.log");
+        let mut plain = fs::File::create(&plain_path).expect("create");
+        for i in 0..100 {
+            writeln!(plain, "line {i:03}").expect("write");
+        }
+        assert!(rotate_log_fd(plain.as_raw_fd(), &own, 500, 30).expect("rotate plain"));
+        writeln!(plain, "after").expect("write after");
+        assert_eq!(
+            fs::read_to_string(&plain_path).expect("read"),
+            "after\n",
+            "no hole"
+        );
+        // Sol v0.2.24 r4: keeping the tail fails (here the staging path is a
+        // directory; in life, a full disk) — the log is truncated anyway.
+        for i in 0..100 {
+            writeln!(plain, "line {i:03}").expect("write");
+        }
+        fs::create_dir_all(dir.join("plain.log.1.tmp")).expect("blocker");
+        assert!(rotate_log_fd(plain.as_raw_fd(), &own, 500, 30).expect("rotate anyway"));
+        assert_eq!(
+            fs::metadata(&plain_path).expect("meta").len(),
+            0,
+            "space freed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn idle_cycles_are_not_logged() {
+        let idle = json!({
+            "action": "daemon_cycle", "ok": true, "enqueued": 0, "observed": 0,
+            "delivery": {"attempted": 0, "delivered": 0, "failed": 0},
+            "bridgeTurns": {"answered": 0, "failed": 0, "ok": true},
+            "telegramUpdates": {"ok": true, "seen": 0, "failed": 0}
+        });
+        assert!(!cycle_is_noteworthy(&idle));
+        let mut busy = idle.clone();
+        busy["telegramUpdates"]["seen"] = json!(1);
+        assert!(cycle_is_noteworthy(&busy));
+        let mut broken = idle.clone();
+        broken["telegramUpdates"]["ok"] = json!(false);
+        assert!(cycle_is_noteworthy(&broken));
     }
 
     /// The deadlock Sol hit on a real run: `cancel` looks for a child, the
