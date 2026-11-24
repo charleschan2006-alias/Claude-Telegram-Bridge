@@ -1715,7 +1715,27 @@ fn open_xinput_stream(candidate: &XCandidate) -> Option<XSession> {
             command.env_remove("XAUTHORITY");
         }
     }
+    // Die with the daemon (v0.2.22). `xinput test-xi2 --root` selects
+    // pointer button events on the root window, which only ONE client may
+    // hold (a second one gets BadAccess and exits at once). The service runs
+    // with KillMode=process, so a restart used to leave the old xinput
+    // orphaned and holding the root: every new listener failed, 电脑优先
+    // could not prove the keyboard untouched, and each batch went to the PC
+    // until some input happened to kill the orphan (a write to its dead
+    // pipe). Measured 2026-11-24: a ~25s gap, and later an indefinite one.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong);
+            Ok(())
+        });
+    }
     let mut child = command.spawn().ok()?;
+    #[cfg(not(test))]
+    if let Ok(dir) = crate::state::state_dir_path() {
+        remember_listener_child(&dir, child.id());
+    }
     let stdout = child.stdout.take()?;
     Some(XSession {
         reader: Box::new(std::io::BufReader::new(stdout)),
@@ -1738,11 +1758,157 @@ fn open_xinput_stream(candidate: &XCandidate) -> Option<XSession> {
 /// Failure is silent and total: no X session, no xinput, a crashed child —
 /// the file simply stops advancing, gates read "no recent keypress", and
 /// away mode keeps the prompt on the phone. That is the safe direction.
+/// The xinput children this daemon started, so the NEXT daemon can stop any
+/// that outlived it (see `open_xinput_stream`): `pid start-ticks` per line.
+const INPUT_LISTENER_PIDS_FILE: &str = "input-listener.pids";
+
+/// Is `pid` still the `xinput test-xi2 --root` started at `start`?
+fn is_our_xinput(pid: u32, start: &str) -> bool {
+    crate::claude::process_start_ticks(pid).as_deref() == Some(start)
+        && std::fs::read(format!("/proc/{pid}/cmdline"))
+            .is_ok_and(|cmdline| cmdline == b"xinput\0test-xi2\0--root\0")
+}
+
+fn listener_children(dir: &Path) -> Vec<(u32, String)> {
+    std::fs::read_to_string(dir.join(INPUT_LISTENER_PIDS_FILE))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (pid, start) = line.split_once(' ')?;
+            Some((pid.parse().ok()?, start.to_string()))
+        })
+        .collect()
+}
+
+fn write_listener_children(dir: &Path, children: &[(u32, String)]) {
+    let body: String = children
+        .iter()
+        .map(|(pid, start)| format!("{pid} {start}\n"))
+        .collect();
+    let _ = std::fs::write(dir.join(INPUT_LISTENER_PIDS_FILE), body);
+}
+
+/// Record a freshly spawned xinput (dropping entries that are gone).
+fn remember_listener_child(dir: &Path, pid: u32) {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(start) = crate::claude::process_start_ticks(pid) else {
+        return;
+    };
+    let mut children: Vec<(u32, String)> = listener_children(dir)
+        .into_iter()
+        .filter(|(pid, start)| is_our_xinput(*pid, start))
+        .collect();
+    children.push((pid, start));
+    write_listener_children(dir, &children);
+}
+
+/// Daemon start: stop any xinput a previous daemon left running — it would
+/// hold the root window and lock this daemon's listener out. Only processes
+/// recorded by us, still with the same start time and exact command line.
+fn stop_orphaned_listener_children(dir: &Path) {
+    let stop = |pid: u32, why: &str| {
+        eprintln!("tinyctb: stopping keyboard listener {pid} ({why})");
+        if let Ok(pid) = libc::pid_t::try_from(pid) {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+    };
+    for (pid, start) in listener_children(dir) {
+        if is_our_xinput(pid, &start) {
+            stop(pid, "left by a previous daemon");
+        }
+    }
+    write_listener_children(dir, &[]);
+    // A daemon older than the pid file left no record (Sol v0.2.23 r1: the
+    // upgrade itself). Also stop any ORPHANED `xinput test-xi2 --root` of
+    // this user — adopted by init or the user's systemd, i.e. its parent is
+    // gone. One started from a shell still has that shell as its parent and
+    // is left alone.
+    // Never from a test run: it would stop real processes on this machine.
+    #[cfg(not(test))]
+    for pid in orphaned_xinputs() {
+        stop(pid, "orphaned");
+    }
+}
+
+/// This user's `xinput test-xi2 --root` processes whose parent is init or a
+/// `systemd` (user) manager — orphans nobody reads.
+fn orphaned_xinputs() -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = unsafe { libc::getuid() };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::metadata(format!("/proc/{pid}")).is_ok_and(|meta| meta.uid() == uid)
+                && std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .is_ok_and(|cmdline| cmdline == b"xinput\0test-xi2\0--root\0")
+        })
+        .filter(|pid| {
+            let Some(ppid) = parent_pid(*pid) else {
+                return false;
+            };
+            ppid == 1
+                || std::fs::read_to_string(format!("/proc/{ppid}/comm"))
+                    .is_ok_and(|comm| comm.trim() == "systemd")
+        })
+        // And its output goes NOWHERE (Sol v0.2.23 r2): stdout is a pipe no
+        // process reads any more — exactly what a dead daemon leaves behind,
+        // and such an xinput dies at its next event anyway. One writing to a
+        // file or a live reader (`nohup … > log`, another tool) is left alone.
+        .filter(|pid| stdout_pipe_has_no_reader(*pid))
+        .collect()
+}
+
+/// `pid`'s stdout is a pipe and no other process holds that pipe open.
+fn stdout_pipe_has_no_reader(pid: u32) -> bool {
+    let Ok(target) = std::fs::read_link(format!("/proc/{pid}/fd/1")) else {
+        return false;
+    };
+    let target = target.to_string_lossy().into_owned();
+    if !target.starts_with("pipe:[") {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for other in entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|other| *other != pid)
+    {
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{other}/fd")) else {
+            continue;
+        };
+        if fds
+            .flatten()
+            .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+            .any(|link| link.to_string_lossy() == target)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Field 4 of `/proc/<pid>/stat` (after the parenthesised command name).
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
 fn spawn_keyboard_listener() {
     std::thread::spawn(|| {
         let Ok(dir) = crate::state::state_dir_path() else {
             return;
         };
+        stop_orphaned_listener_children(&dir);
         let publisher = Arc::new(ActivityPublisher::default());
         let mut workers: std::collections::HashMap<XCandidate, Worker> =
             std::collections::HashMap::new();
@@ -5414,6 +5580,43 @@ mod tests {
         publisher.fail_after_create.store(false, Ordering::Relaxed);
         assert!(publisher.flush_pending(&dir));
         assert_eq!(read(), 2_000);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// v0.2.22: the listener pid file records our xinput children; a start
+    /// only stops a recorded process that is still OUR xinput (same start
+    /// time, exact command line) — never anything else — and clears the file.
+    #[test]
+    fn orphaned_listener_cleanup_only_touches_our_xinput() {
+        let dir = temp_dir("listener-pids");
+        let me = std::process::id();
+        remember_listener_child(&dir, me);
+        assert_eq!(listener_children(&dir).len(), 1);
+        assert!(
+            !is_our_xinput(me, &listener_children(&dir)[0].1),
+            "not an xinput"
+        );
+        // Not ours to stop: this test process survives, the file is cleared.
+        stop_orphaned_listener_children(&dir);
+        assert!(listener_children(&dir).is_empty());
+        // The parent of this test process is the test harness, not init.
+        assert_eq!(parent_pid(me), Some(std::os::unix::process::parent_id()));
+        assert!(!orphaned_xinputs().contains(&me));
+        // A child whose stdout pipe we still read is not reader-less.
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        assert!(
+            !stdout_pipe_has_no_reader(child.id()),
+            "we hold the read end"
+        );
+        // Drop the read end: now nobody reads it — the dead-daemon case.
+        drop(child.stdout.take());
+        assert!(stdout_pipe_has_no_reader(child.id()), "no reader left");
+        let _ = child.kill();
+        let _ = child.wait();
         let _ = fs::remove_dir_all(&dir);
     }
 
