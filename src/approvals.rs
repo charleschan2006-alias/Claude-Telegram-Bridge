@@ -1533,9 +1533,13 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         tx.commit()?;
     }
 
-    // A multi-select question gets checkboxes + a submit button (v0.2.20);
-    // the comma reply still works alongside them.
-    let checkboxes = multi_select && !options.is_empty() && options.len() <= 8;
+    // A multi-select question gets a Telegram poll (v0.2.21: ticks change on
+    // the phone itself, one vote submits them); checkboxes + a submit button
+    // (v0.2.20) only where a poll cannot carry it. The comma reply still
+    // works alongside either.
+    let poll = (multi_select && poll_fits(&options))
+        .then(|| json!({ "question": question_text, "options": options }));
+    let checkboxes = poll.is_none() && multi_select && !options.is_empty() && options.len() <= 8;
     let buttons = if checkboxes {
         checkbox_buttons(
             &conn,
@@ -1559,7 +1563,11 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     };
 
     let cwd = payload.get("cwd").and_then(Value::as_str);
-    let body = question_body(&question_text, &options, multi_select && !checkboxes);
+    let body = question_body(
+        &question_text,
+        &options,
+        multi_select && !checkboxes && poll.is_none(),
+    );
     let event = json!({
         "type": "question_request",
         "threadId": thread_id,
@@ -1569,6 +1577,7 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         "lastPreview": body,
         "buttons": buttons,
         "checkboxes": checkboxes,
+        "poll": poll,
         // Measured here, first-hand, and carried to the phone: a background
         // session's terminal cannot show this question, so the message must
         // not let the reader assume a dialog is waiting for them at home.
@@ -1780,7 +1789,9 @@ fn release_question_batch(
                     None => crate::state::mark_question_native_attach(&tx, &question_id)?,
                 }
                 anchor_question_id.get_or_insert_with(|| question_id.clone());
-                let buttons = if multi_select {
+                let buttons = if multi_select && poll_fits(&options) {
+                    Vec::new()
+                } else if multi_select {
                     checkbox_buttons(&tx, chat_id, thread_id, &question_id, &options, now)?
                 } else {
                     question_answer_buttons(&tx, chat_id, thread_id, &question_id, &options, now)?
@@ -1819,7 +1830,11 @@ fn release_question_batch(
                 },
                 "lastPreview": body,
                 "buttons": buttons,
-                "checkboxes": injectable && multi_select,
+                "checkboxes": injectable && multi_select && !poll_fits(&options),
+                "poll": (injectable && multi_select && poll_fits(&options)).then(|| json!({
+                    "question": format!("第 {}/{} 问：{question_text}", seq + 1, total),
+                    "options": options,
+                })),
                 "terminalVisibility": terminal_visibility(session_window),
                 "thread": {
                     "threadId": thread_id,
@@ -2730,22 +2745,38 @@ pub(crate) fn question_answer_buttons(
             },
             now,
         )?;
-        // Colour makes a row read as a button; the letter makes options
-        // distinguishable at a glance (and is what a text reply can name).
-        // Unicode has no full A–Z coloured-letter set — 🅰️🅱️ stop at B and
-        // regional indicators (🇦🇧🇨) render flat on some clients — so a
-        // saturated dot supplies the colour and the letter follows it.
-        const MARKERS: [&str; 8] = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "🟤", "⚫"];
-        let marker = MARKERS[index.min(MARKERS.len() - 1)];
-        let letter = (b'A' + index as u8) as char;
         buttons.push(json!({
-            "text": format!("{marker}{letter} {}", truncate_tool_detail(label)),
+            "text": option_button_text(index, label, false),
             "callbackId": callback_id,
             "action": TelegramCallbackAction::AnswerQuestion.as_str(),
             "answer": label
         }));
     }
     Ok(buttons)
+}
+
+/// A single-select option button: a coloured dot and the letter (`🔴A 猫`),
+/// or — once chosen on the phone (v0.2.21) — a tick in the dot's place
+/// (`✅A 猫`), so the message itself shows what was picked.
+pub(crate) fn option_button_text(index: usize, label: &str, chosen: bool) -> String {
+    // Colour makes a row read as a button; the letter makes options
+    // distinguishable at a glance (and is what a text reply can name).
+    // Unicode has no full A–Z coloured-letter set — 🅰️🅱️ stop at B and
+    // regional indicators (🇦🇧🇨) render flat on some clients — so a
+    // saturated dot supplies the colour and the letter follows it.
+    const MARKERS: [&str; 8] = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "🟤", "⚫"];
+    let marker = if chosen {
+        "✅"
+    } else {
+        MARKERS[index.min(MARKERS.len() - 1)]
+    };
+    let letter = (b'A' + index as u8) as char;
+    format!("{marker}{letter} {}", truncate_tool_detail(label))
+}
+
+/// Can a Telegram poll carry these options (2–10 of them)? (v0.2.21)
+pub(crate) fn poll_fits(options: &[String]) -> bool {
+    (2..=10).contains(&options.len())
 }
 
 /// A checkbox button's label (v0.2.20): `⬜ A 奶酪` / `✅ A 奶酪`. Shared by
@@ -5220,10 +5251,10 @@ mod tests {
         assert_eq!(
             payloads
                 .iter()
-                .filter(|p| p.contains("\"checkboxes\":true") && p.contains("submit_checked"))
+                .filter(|p| p.contains("\"poll\":{") && p.contains("第 "))
                 .count(),
             1,
-            "the multi-select tab carries checkboxes and its own submit"
+            "the multi-select tab carries its own poll"
         );
         assert_eq!(
             payloads
@@ -6427,26 +6458,18 @@ mod tests {
             })
             .expect("outbound");
         let event: Value = serde_json::from_str(&payload_json).expect("json");
-        // v0.2.20: no one-tap answer buttons — checkboxes (which answer
-        // nothing on their own) and a submit button under them.
-        let actions: Vec<&str> = event["buttons"]
-            .as_array()
-            .expect("buttons")
-            .iter()
-            .map(|b| b["action"].as_str().expect("action"))
-            .collect();
+        // v0.2.21: no one-tap answer buttons — a poll (ticks on the phone,
+        // one vote submits them) carries the options.
+        assert_eq!(event["buttons"], json!([]), "{event}");
+        assert_eq!(event["checkboxes"], false, "{event}");
         assert_eq!(
-            actions,
-            [
-                "toggle_option",
-                "toggle_option",
-                "toggle_option",
-                "submit_checked"
-            ],
+            event["poll"],
+            json!({
+                "question": "这个项目用哪个数据库？",
+                "options": ["Postgres", "MySQL", "SQLite"]
+            }),
             "{event}"
         );
-        assert_eq!(event["buttons"][0]["text"], "⬜ A Postgres");
-        assert_eq!(event["checkboxes"], true, "{event}");
     }
 
     /// The answers map is keyed by the question text exactly as the tool sent

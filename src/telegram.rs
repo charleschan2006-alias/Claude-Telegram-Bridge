@@ -726,6 +726,21 @@ fn deliver_prepared_telegram_delivery(
         route.message_id = Some(keyboard_message_id);
         update_telegram_callback_message_id(conn, &route.callback_id, keyboard_message_id)?;
     }
+    // A multi-select question's poll goes right under its text (v0.2.21).
+    // Best-effort: the text is already out (failing the delivery now would
+    // resend it), and it tells the user they can also reply with letters.
+    let mut poll_error = None;
+    if let (Some(poll), Some(question_id)) =
+        (prepared.poll.as_ref(), prepared.question_id.as_deref())
+    {
+        match send_question_poll(conn, telegram, poll, question_id, prepared, now, timeout) {
+            Ok(message_id) => message_ids.push(message_id),
+            Err(error) => {
+                eprintln!("tinyctb: question poll not sent: {error:#}");
+                poll_error = Some(format!("{error:#}"));
+            }
+        }
+    }
     if let Some(thread_id) = prepared.thread_id.as_deref() {
         clear_telegram_typing_indicator(conn, telegram, thread_id)?;
     }
@@ -736,8 +751,55 @@ fn deliver_prepared_telegram_delivery(
         "messageIds": message_ids,
         "chunks": prepared.payloads.len(),
         "threadId": prepared.thread_id,
-        "callbacks": prepared.callback_routes.len()
+        "callbacks": prepared.callback_routes.len(),
+        "pollError": poll_error
     }))
+}
+
+/// Send a question's poll and remember it: the poll id maps a
+/// vote back to the question, and the message is registered like the text
+/// so a reply to the poll (`A,C`) answers the question too.
+fn send_question_poll(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    poll: &Value,
+    question_id: &str,
+    prepared: &PreparedTelegramDelivery,
+    now: u64,
+    timeout: Duration,
+) -> Result<i64> {
+    // Never retried (Sol v0.2.21 r1): a timeout may hide a poll Telegram DID
+    // post, and a second one would leave the first unregistered — its votes
+    // matched to nothing. A vote on an unknown poll is told to reply instead.
+    let response = self::api::telegram_api_post(&telegram.bot_token, "sendPoll", poll, timeout)?;
+    let message_id = response
+        .pointer("/result/message_id")
+        .and_then(Value::as_i64)
+        .context("Telegram sendPoll response missing result.message_id")?;
+    let poll_id = response
+        .pointer("/result/poll/id")
+        .and_then(Value::as_str)
+        .context("Telegram sendPoll response missing result.poll.id")?;
+    crate::state::attach_question_poll(conn, question_id, poll_id, message_id)?;
+    crate::state::record_dialog_message(
+        conn,
+        &telegram.chat_id,
+        message_id,
+        "question",
+        question_id,
+        now,
+    )?;
+    if let Some(thread_id) = prepared.thread_id.as_deref() {
+        insert_telegram_message_route(
+            conn,
+            &telegram.chat_id,
+            message_id,
+            thread_id,
+            &prepared.event_id,
+            now,
+        )?;
+    }
+    Ok(message_id)
 }
 
 /// Feedback for an authorized message that matched no route. Plain text never
@@ -3574,6 +3636,356 @@ fn checked_labels(checked: &[usize], options: &[String]) -> String {
         .join(", ")
 }
 
+/// Daemon sweep (v0.2.21): close the phone messages of questions that have
+/// settled — answered (either side), won by the PC, or past their deadline.
+/// Each keyboard collapses to one line saying how it ended (its button still
+/// answers a tap with the status), and a poll is stopped so it can take no
+/// more votes. Best-effort: a failed edit is not retried forever. Returns how
+/// many questions were closed.
+pub(crate) fn finalize_settled_question_messages(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    now: u64,
+    timeout: Duration,
+) -> Result<usize> {
+    // A transient failure (network, 429, 5xx) pauses the whole sweep for a
+    // while: with Telegram unreachable, every wake would otherwise spend its
+    // budget on calls that cannot land.
+    if crate::state::get_setting_number(conn, FINALIZE_PAUSE_KEY)?.is_some_and(|until| now < until)
+    {
+        return Ok(0);
+    }
+    let since = now.saturating_sub(24 * 60 * 60 * 1000);
+    let settled = crate::state::settled_unfinalized_questions(conn, now, since)?;
+    let batches = crate::state::settled_batch_messages(conn, now, since)?;
+    // Bounded per wake (Sol v0.2.21 r2/r3): every call gets at most what is
+    // left of the wake's budget; once it is spent the sweep stops. Progress
+    // is kept PER MESSAGE (Sol v0.2.21 r4), so the next wake resumes after
+    // the last message it closed instead of starting the question over.
+    let deadline = std::time::Instant::now() + FINALIZE_WAKE_BUDGET;
+    let call_timeout = || {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        (!left.is_zero()).then(|| left.min(timeout).min(FINALIZE_CALL_TIMEOUT))
+    };
+    // One call: `Some(true)` closed (or can never be), `Some(false)` a
+    // transient failure, `None` out of budget (not attempted).
+    let close = |method: &str, payload: &Value| -> Option<bool> {
+        let call_timeout = call_timeout()?;
+        match self::api::telegram_api_post(&telegram.bot_token, method, payload, call_timeout) {
+            Ok(_) => Some(true),
+            Err(error) => {
+                let error = format!("{error:#}");
+                if !error.contains("message is not modified")
+                    && !error.contains("poll has already been closed")
+                {
+                    eprintln!("tinyctb: closing question message ({method}) failed: {error}");
+                }
+                Some(telegram_error_is_final(&error))
+            }
+        }
+    };
+    let one_button = |message_id: i64, text: &str, callback_id: &str| {
+        json!({
+            "chat_id": telegram.chat_id,
+            "message_id": message_id,
+            "reply_markup": { "inline_keyboard": [[{
+                "text": text,
+                "callback_data": format!("claude:{callback_id}")
+            }]] }
+        })
+    };
+    let mut closed = 0;
+    let mut pause = false;
+    'questions: for question in &settled {
+        let label = settled_question_label(question);
+        let mut calls: Vec<(i64, &str, &str, Value)> = question
+            .keyboards
+            .iter()
+            .map(|(message_id, callback_id)| {
+                (
+                    *message_id,
+                    "keyboard",
+                    "editMessageReplyMarkup",
+                    one_button(*message_id, &label, callback_id),
+                )
+            })
+            .collect();
+        if let Some(message_id) = question.poll_message_id {
+            calls.push((
+                message_id,
+                "poll",
+                "stopPoll",
+                json!({ "chat_id": telegram.chat_id, "message_id": message_id }),
+            ));
+        }
+        let mut transient = false;
+        for (message_id, kind, method, payload) in &calls {
+            if crate::state::question_message_closed(conn, *message_id, kind)? {
+                continue;
+            }
+            match close(method, payload) {
+                None => {
+                    // Out of budget — but a transient failure earlier in
+                    // this question still counts (Sol v0.2.21 r5): back off,
+                    // or a flaky network re-spends every wake on it.
+                    if transient {
+                        crate::state::mark_question_finalize_failed(
+                            conn,
+                            &question.question_id,
+                            now,
+                        )?;
+                        pause = true;
+                    }
+                    break 'questions;
+                }
+                Some(true) => {
+                    crate::state::mark_question_message_closed(conn, *message_id, kind, now)?
+                }
+                Some(false) => transient = true,
+            }
+        }
+        if transient {
+            crate::state::mark_question_finalize_failed(conn, &question.question_id, now)?;
+            pause = true;
+            break;
+        }
+        crate::state::mark_question_finalized(conn, &question.question_id, now)?;
+        closed += 1;
+    }
+    if !pause {
+        for (message_id, callback_id, pc_won) in &batches {
+            let text = if *pc_won {
+                "🖥️ 电脑已抢答"
+            } else {
+                "✅ 这组题已结束"
+            };
+            match close(
+                "editMessageReplyMarkup",
+                &one_button(*message_id, text, callback_id),
+            ) {
+                None => break,
+                Some(true) => {
+                    crate::state::mark_question_message_closed(conn, *message_id, "keyboard", now)?
+                }
+                Some(false) => {
+                    pause = true;
+                    break;
+                }
+            }
+        }
+    }
+    if pause {
+        crate::state::set_setting(
+            conn,
+            FINALIZE_PAUSE_KEY,
+            now.saturating_add(crate::state::FINALIZE_RETRY_MS),
+        )?;
+    }
+    Ok(closed)
+}
+
+/// Settings key: no closing sweep before this time (after a transient
+/// Telegram failure).
+const FINALIZE_PAUSE_KEY: &str = "question_finalize_paused_until";
+
+/// Per-call timeout and per-wake budget of the closing sweep.
+const FINALIZE_CALL_TIMEOUT: Duration = Duration::from_secs(2);
+const FINALIZE_WAKE_BUDGET: Duration = Duration::from_secs(2);
+
+/// A Telegram refusal that retrying cannot change (400 / 403: the message is
+/// gone, cannot be edited, is unchanged, the poll is already closed).
+fn telegram_error_is_final(error: &str) -> bool {
+    [
+        "status: 400",
+        "status: 403",
+        "\"error_code\":400",
+        "\"error_code\":403",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+}
+
+/// The one line a settled question's buttons collapse to.
+fn settled_question_label(question: &crate::state::SettledQuestion) -> String {
+    if question.pc_won {
+        return "🖥️ 电脑已抢答".to_string();
+    }
+    match question.answer.as_deref() {
+        Some(crate::state::QUESTION_ANSWERED_ELSEWHERE) => "🖥️ 已在电脑上作答".to_string(),
+        Some(answer) if !answer.starts_with('\u{0}') => {
+            let mut shown: String = answer.chars().take(40).collect();
+            if answer.chars().count() > 40 {
+                shown.push('…');
+            }
+            format!("✅ 已作答：{shown}")
+        }
+        _ if question.expired => "⌛ 手机答复窗口已关闭".to_string(),
+        _ => "✅ 已结束".to_string(),
+    }
+}
+
+/// A vote on a multi-select question's poll (v0.2.21): the ticks were set on
+/// the phone itself, and the vote submits them exactly as「提交这题」does
+/// (stage / inject / record). A retracted vote (no options) un-stages a tab
+/// that is still only staged. The outcome goes back as a short message — a
+/// vote has no toast.
+fn answer_question_poll(
+    conn: &Connection,
+    poll_answer: &Value,
+    telegram: &TelegramConfig,
+    now: u64,
+    timeout: Duration,
+) -> Result<Value> {
+    let ignored = |why: &str| json!({ "ok": true, "action": "telegram_poll_ignored", "why": why });
+    let user_id = poll_answer
+        .pointer("/user/id")
+        .and_then(|value| value.as_i64().map(|id| id.to_string()));
+    if !telegram_authorized(
+        telegram,
+        Some(telegram.chat_id.as_str()),
+        user_id.as_deref(),
+    ) {
+        return Ok(ignored("unauthorized"));
+    }
+    let Some(poll_id) = poll_answer.get("poll_id").and_then(Value::as_str) else {
+        return Ok(ignored("no poll id"));
+    };
+    let Some(question_id) = crate::state::question_for_poll(conn, poll_id)? else {
+        // Not silently dropped: a poll whose send timed out was never
+        // registered, and the user believes they answered.
+        let notice =
+            "这个投票没能对应到题目上，答案没有记下。请直接回复题目消息，用字母作答（如 A,C）。";
+        let sent = send_telegram_command_text(telegram, notice, timeout)?;
+        return Ok(json!({
+            "ok": true,
+            "action": "telegram_poll_unknown",
+            "pollId": poll_id,
+            "notice": notice,
+            "sent": sent
+        }));
+    };
+    let option_ids: Vec<usize> = poll_answer
+        .get("option_ids")
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_u64)
+                .filter_map(|id| usize::try_from(id).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let notice = record_poll_vote(conn, &question_id, &option_ids, now)?;
+    let sent = send_telegram_command_text(telegram, &notice, timeout)?;
+    Ok(json!({
+        "ok": true,
+        "action": "telegram_question_poll",
+        "questionId": question_id,
+        "optionIds": option_ids,
+        "notice": notice,
+        "sent": sent
+    }))
+}
+
+/// The state change behind a poll vote; returns what to tell the user.
+fn record_poll_vote(
+    conn: &Connection,
+    question_id: &str,
+    option_ids: &[usize],
+    now: u64,
+) -> Result<String> {
+    let Some(prompt) = crate::state::question_prompt(conn, question_id)? else {
+        return Ok("这个投票对应的问题已经失效了。".to_string());
+    };
+    if prompt.batch.is_some() && pc_priority_check(conn, question_id, now)? {
+        return Ok(PC_WON.to_string());
+    }
+    let mut ticked: Vec<usize> = option_ids
+        .iter()
+        .copied()
+        .filter(|index| *index < prompt.options.len())
+        .collect();
+    ticked.sort_unstable();
+    ticked.dedup();
+    if ticked.is_empty() {
+        // Retracted. Only a tab that is still just staged (an interactive
+        // batch not typed yet) can take it back; anything submitted stays.
+        if matches!(
+            crate::state::pending_question_status(conn, question_id, now)?,
+            crate::state::QuestionStatus::Expired
+        ) {
+            return Ok("这个问题的手机答复窗口已关闭。".to_string());
+        }
+        let still_staged = prompt.batch.is_some()
+            && prompt.inject_window.is_some()
+            && !crate::state::batch_submitted(conn, question_id)?;
+        if still_staged {
+            // Only what the poll itself set (Sol v0.2.21 r1): a text reply
+            // that changed the ticks since is newer than this retraction.
+            // The poll's vote is remembered only until anything else writes
+            // the ticks (`set_checked_options` forgets it).
+            let current = crate::state::checked_options(conn, question_id)?;
+            if crate::state::poll_vote(conn, question_id)?.as_deref() != Some(current.as_slice()) {
+                return Ok(format!(
+                    "这题后来用文字回复改过答案（现在是：{}），撤回投票不影响它。",
+                    checked_labels(&current, &prompt.options)
+                ));
+            }
+            if crate::state::set_checked_options(conn, question_id, &[])? {
+                crate::state::set_poll_vote(conn, question_id, &[])?;
+                return Ok("已撤回这题的选择，重新投票即可。".to_string());
+            }
+        }
+        // Nothing went in for this row (Sol v0.2.21 r4: a fork tab whose
+        // injection failed before any key stays open) — say so, rather than
+        // "already submitted".
+        if !crate::state::batch_submitted(conn, question_id)?
+            && matches!(
+                crate::state::pending_question_status(conn, question_id, now)?,
+                crate::state::QuestionStatus::Open
+            )
+        {
+            return Ok(
+                "已撤回。这题之前的投票没能送进电脑，答案没有提交，重新投票即可。".to_string(),
+            );
+        }
+        // This tab's ticks are in the dialog, but the batch is still open on
+        // the phone (Sol v0.2.21 r6): the other tabs and「提交已答的」work.
+        if !crate::state::batch_submitted(conn, question_id)?
+            && matches!(
+                crate::state::pending_question_status(conn, question_id, now)?,
+                crate::state::QuestionStatus::Delivered
+            )
+        {
+            return Ok(
+                "这题的勾选已经送进电脑上的对话框，撤回投票改不了它；其余题照常作答，或点「提交已答的」。"
+                    .to_string(),
+            );
+        }
+        // Handed to the PC but not recorded yet (Sol v0.2.21 r5: e.g. only
+        // some of a fork tab's ticks went in): the dialog is still waiting.
+        if !matches!(
+            crate::state::pending_question_status(conn, question_id, now)?,
+            crate::state::QuestionStatus::Answered
+        ) {
+            return Ok(
+                "这组题已经交给电脑上的对话框，撤回投票改不了它；如果电脑上还没提交，请到电脑上核对后提交。"
+                    .to_string(),
+            );
+        }
+        return Ok("这题已经提交了，撤回投票不会改变已交的答案。".to_string());
+    }
+    // A row that no longer takes ticks keeps its old set; `submit_checked`
+    // then reports why (submitted, answered, expired, handed off).
+    let fresh = crate::state::set_checked_options(conn, question_id, &ticked)?;
+    let (toast, _) = submit_checked(conn, question_id, now)?;
+    // Remembered AFTER the submit (whose staging rewrites the ticks too),
+    // and only if the poll's set is what now stands.
+    if fresh && crate::state::checked_options(conn, question_id)? == ticked {
+        crate::state::set_poll_vote(conn, question_id, &ticked)?;
+    }
+    Ok(toast)
+}
+
 /// Tick / untick one checkbox (v0.2.20). Answers nothing — the「提交这题」
 /// button does — and returns the redrawn keyboard for the dispatcher to put
 /// on the tapped message. The route is never consumed.
@@ -3661,6 +4073,83 @@ fn toggle_checkbox(conn: &Connection, route: &RoutedTelegramCallback, now: u64) 
     Ok(reply(&toast, true, keyboard))
 }
 
+/// A single-select question's keyboard with the picked option ticked
+/// (v0.2.21). The pick is the tapped button (`tapped` = its callback id,
+/// passed only when the tap was accepted), or else the staged answer of an
+/// interactive batch tab. `None` when there is nothing to show — no pick, no
+/// buttons on that message, or the question is no longer live there.
+fn chosen_option_keyboard(
+    conn: &Connection,
+    question_id: &str,
+    message_id: i64,
+    tapped: Option<&str>,
+    now: u64,
+) -> Result<Option<Value>> {
+    let Some(prompt) = crate::state::question_prompt(conn, question_id)? else {
+        return Ok(None);
+    };
+    // Only while the question is still live on the phone (Sol v0.2.21 r1): a
+    // closed message (settled, won by the PC) must not get its options back.
+    if crate::state::question_finalized(conn, question_id)?
+        || (prompt.batch.is_some() && crate::state::batch_pc_won(conn, question_id)?)
+        || !matches!(
+            crate::state::pending_question_status(conn, question_id, now)?,
+            crate::state::QuestionStatus::Open | crate::state::QuestionStatus::Delivered
+        )
+    {
+        return Ok(None);
+    }
+    let staged = crate::state::batch_rows(conn, question_id, now)?
+        .and_then(|b| b.tabs.into_iter().find(|t| t.question_id == question_id))
+        .and_then(|t| t.staged_answer);
+    let routes_for_tap = crate::state::message_question_routes(conn, question_id, message_id)?;
+    // The TAPPED button is the pick when the tap was accepted (Sol v0.2.21
+    // r1: two options may share a label); otherwise the staged label.
+    let tapped_index = tapped.and_then(|callback_id| {
+        routes_for_tap
+            .iter()
+            .filter(|(_, action, _)| action == "answer_question")
+            .position(|(id, _, _)| id == callback_id)
+    });
+    let picked = match (tapped_index, staged.as_deref()) {
+        (Some(_), _) => None,
+        (None, Some(label)) => Some(label),
+        (None, None) => return Ok(None),
+    };
+    let answers: Vec<_> = routes_for_tap
+        .iter()
+        .filter(|(_, action, _)| action == "answer_question")
+        .collect();
+    if answers.is_empty() {
+        return Ok(None);
+    }
+    let mut chosen_seen = false;
+    let buttons: Vec<(String, String)> = answers
+        .iter()
+        .enumerate()
+        .map(|(index, (callback_id, _, answer))| {
+            let label = answer.as_deref().unwrap_or_default();
+            // The tapped button, or the FIRST with the staged label.
+            let chosen = match tapped_index {
+                Some(tapped) => index == tapped,
+                None => !chosen_seen && Some(label) == picked,
+            };
+            chosen_seen |= chosen;
+            let shown = prompt
+                .options
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or(label);
+            (
+                crate::approvals::option_button_text(index, shown, chosen),
+                callback_id.clone(),
+            )
+        })
+        .collect();
+    let rows = self::render::layout_button_rows(&buttons, false);
+    Ok(Some(json!({ "inline_keyboard": rows })))
+}
+
 /// Redraw a checkbox message's keyboard — best-effort, retried once; the
 /// toast (or reply) already named the whole ticked set if this fails.
 fn edit_checkbox_markup(
@@ -3701,12 +4190,25 @@ fn redraw_question_checkboxes(
     conn: &Connection,
     telegram: &TelegramConfig,
     question_id: &str,
+    now: u64,
     timeout: Duration,
 ) -> Result<()> {
     let Some(prompt) = crate::state::question_prompt(conn, question_id)? else {
         return Ok(());
     };
     if !prompt.multi_select {
+        // A single-select tab staged by a typed reply ticks the staged
+        // option on its message too (Sol v0.2.21 r3) — or the ✅ left by an
+        // earlier tap would show the answer the reply just replaced.
+        if let Some((_, message_id)) =
+            crate::state::question_route_message(conn, question_id, "answer_question")?
+        {
+            if let Some(keyboard) =
+                chosen_option_keyboard(conn, question_id, message_id, None, now)?
+            {
+                edit_checkbox_markup(telegram, message_id, keyboard, timeout);
+            }
+        }
         return Ok(());
     }
     let Some((callback_id, message_id)) = crate::state::question_checkbox_route(conn, question_id)?
@@ -4251,7 +4753,7 @@ fn answer_pending_question_from_reply(
     // only meaningful for the button dispatcher.
     let (notice, outcome, _retryable) = if question_is_native_attach(conn, &question_id)? {
         let answered = inject_native_attach_answer(conn, &question_id, text, now)?;
-        redraw_question_checkboxes(conn, telegram, &question_id, timeout)?;
+        redraw_question_checkboxes(conn, telegram, &question_id, now, timeout)?;
         answered
     } else {
         let outcome = crate::state::record_question_answer(conn, &question_id, text, now)?;
@@ -4737,13 +5239,10 @@ fn process_telegram_update_batch(
                         if !retryable {
                             mark_telegram_callback_route_used(conn, &route.callback_id, now)?;
                         }
-                        // A tick redraws the tapped message's checkboxes.
-                        if let (Some(keyboard), Some(message_id)) = (
-                            answer.get("keyboard").filter(|k| !k.is_null()).cloned(),
-                            route_message_id,
-                        ) {
-                            edit_checkbox_markup(telegram, message_id, keyboard, timeout);
-                        }
+                        // Answer the tap FIRST (v0.2.21): the client spins
+                        // the button until it hears back, and every redraw
+                        // done before the answer was dead time in the user's
+                        // hand.
                         let ack = acknowledge_callback_tap(
                             telegram,
                             &route.callback_query_id,
@@ -4753,6 +5252,34 @@ fn process_telegram_update_batch(
                                 .unwrap_or("已收到"),
                             timeout,
                         );
+                        // A tick redraws the tapped message's checkboxes.
+                        if let (Some(keyboard), Some(message_id)) = (
+                            answer.get("keyboard").filter(|k| !k.is_null()).cloned(),
+                            route_message_id,
+                        ) {
+                            edit_checkbox_markup(telegram, message_id, keyboard, timeout);
+                        }
+                        // A single-select choice ticks its own button, so the
+                        // message shows what was picked (v0.2.21).
+                        if let (Some(question_id), Some(message_id)) =
+                            (route.question_id.as_deref(), route_message_id)
+                        {
+                            if route.action == TelegramCallbackAction::AnswerQuestion {
+                                let accepted = matches!(
+                                    answer.get("outcome").and_then(Value::as_str),
+                                    Some("Delivered") | Some("Recorded")
+                                );
+                                if let Some(keyboard) = chosen_option_keyboard(
+                                    conn,
+                                    question_id,
+                                    message_id,
+                                    accepted.then_some(route.callback_id.as_str()),
+                                    now,
+                                )? {
+                                    edit_checkbox_markup(telegram, message_id, keyboard, timeout);
+                                }
+                            }
+                        }
                         // The update stays acked even when the toast could
                         // not be delivered (queue protection), but the
                         // failure is recorded, not discarded.
@@ -4827,6 +5354,24 @@ fn process_telegram_update_batch(
                         ignored += 1;
                     }
                 }
+            } else if let Some(poll_answer) = update.get("poll_answer") {
+                // A vote on a multi-select question's poll (v0.2.21).
+                let result = answer_question_poll(conn, poll_answer, telegram, now, timeout)?;
+                if let Some(update_id) = update_id {
+                    record_telegram_inbound_processed(
+                        conn,
+                        bot_id,
+                        update_id,
+                        "poll_answer",
+                        &result,
+                        TelegramInboundLogContext {
+                            result_action: result.get("action").and_then(Value::as_str),
+                            ..TelegramInboundLogContext::default()
+                        },
+                        now,
+                    )?;
+                }
+                replies += 1;
             }
             Ok(())
         })();
@@ -9221,6 +9766,562 @@ mod tests {
         }
     }
 
+    /// v0.2.21: a poll vote on an interactive batch's multi-select tab
+    /// stages its ticks (nothing typed until the batch is complete); a
+    /// retracted vote un-stages it; the vote that completes the batch types
+    /// it in one pass. A vote after that is refused, and a retraction too.
+    #[test]
+    fn poll_votes_stage_retract_and_complete_an_interactive_batch() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = ["奶酪".to_string(), "火腿".to_string(), "橄榄".to_string()];
+        crate::state::create_pending_question(
+            &conn,
+            "qv0",
+            "sess-win",
+            "配料？",
+            &options,
+            true,
+            1000,
+            9_000_000,
+        )
+        .expect("create");
+        crate::state::set_question_batch(&conn, "qv0", "toolu-v", 0, 2).expect("batch");
+        crate::state::mark_question_xtest_window(&conn, "qv0", 0x2a526d7, &test_terminal())
+            .expect("mark");
+        seed_interactive_batch(&conn, &[("qv1", 1)], 2);
+        crate::state::set_question_batch(&conn, "qv1", "toolu-v", 1, 2).expect("same batch");
+        crate::state::attach_question_poll(&conn, "qv0", "poll-1", 501).expect("poll");
+        assert_eq!(
+            crate::state::question_for_poll(&conn, "poll-1").expect("lookup"),
+            Some("qv0".to_string())
+        );
+        std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
+        let _ = take_xtest_steps();
+
+        let notice = record_poll_vote(&conn, "qv0", &[2, 1, 9], 2000).expect("vote");
+        assert!(notice.contains("火腿, 橄榄"), "{notice}");
+        assert!(take_xtest_steps().is_empty(), "staged, not typed");
+        let staged = |conn: &Connection| {
+            crate::state::batch_rows(conn, "qv0", 2100)
+                .expect("rows")
+                .expect("batch")
+                .tabs[0]
+                .staged_answer
+                .clone()
+        };
+        assert_eq!(staged(&conn).as_deref(), Some("火腿, 橄榄"));
+
+        let notice = record_poll_vote(&conn, "qv0", &[], 2200).expect("retract");
+        assert_eq!(notice, "已撤回这题的选择，重新投票即可。");
+        assert_eq!(staged(&conn), None);
+
+        // Sol v0.2.21 r1: a text reply after the vote is newer — retracting
+        // the (stale) poll vote does not take it back.
+        record_poll_vote(&conn, "qv0", &[0], 2210).expect("vote A");
+        inject_native_attach_answer(&conn, "qv0", "C", 2220).expect("text C");
+        assert_eq!(staged(&conn).as_deref(), Some("橄榄"));
+        let notice = record_poll_vote(&conn, "qv0", &[], 2230).expect("stale retract");
+        assert!(notice.contains("文字回复改过"), "{notice}");
+        assert_eq!(
+            staged(&conn).as_deref(),
+            Some("橄榄"),
+            "the text answer stays"
+        );
+        // Sol v0.2.21 r2: rewritten back to the vote's own set by text is
+        // still newer than the vote.
+        record_poll_vote(&conn, "qv0", &[0], 2240).expect("vote A again");
+        inject_native_attach_answer(&conn, "qv0", "B", 2250).expect("text B");
+        inject_native_attach_answer(&conn, "qv0", "A", 2260).expect("text A");
+        let notice = record_poll_vote(&conn, "qv0", &[], 2270).expect("stale retract 2");
+        assert!(notice.contains("文字回复改过"), "{notice}");
+        assert_eq!(staged(&conn).as_deref(), Some("奶酪"));
+
+        record_poll_vote(&conn, "qv0", &[0], 2300).expect("vote again");
+        inject_native_attach_answer(&conn, "qv1", "乙", 2400).expect("last tab");
+        assert!(
+            take_xtest_steps()
+                .iter()
+                .any(|step| step.starts_with("batch ") && step.contains("1,R")),
+            "the completing answer types the batch"
+        );
+        let notice = record_poll_vote(&conn, "qv0", &[1], 2500).expect("late vote");
+        assert_eq!(notice, BATCH_HANDED_OFF);
+        let notice = record_poll_vote(&conn, "qv0", &[], 2600).expect("late retract");
+        assert!(
+            notice.starts_with("这组题已经交给电脑上的对话框"),
+            "{notice}"
+        );
+        // Once the session records the answer, it is plainly submitted.
+        crate::state::record_question_answer(&conn, "qv0", "奶酪", 2700).expect("recorded");
+        let notice = record_poll_vote(&conn, "qv0", &[], 2800).expect("after record");
+        assert_eq!(notice, "这题已经提交了，撤回投票不会改变已交的答案。");
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+    }
+
+    /// v0.2.21: a settled question's phone messages are closed once — its
+    /// buttons collapse to how it ended, its poll is stopped.
+    #[test]
+    fn settled_question_messages_are_closed_once() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = vec!["甲".to_string(), "乙".to_string()];
+        let base = 1_800_000_000_000u64;
+        crate::state::create_pending_question(
+            &conn,
+            "qs",
+            "sess-x",
+            "选？",
+            &options,
+            false,
+            base,
+            base + 600_000,
+        )
+        .expect("create");
+        crate::approvals::question_answer_buttons(&conn, "999", "sess-x", "qs", &options, base)
+            .expect("buttons");
+        conn.execute(
+            "UPDATE telegram_callback_routes SET message_id = 61 WHERE question_id = 'qs'",
+            [],
+        )
+        .expect("sent");
+        crate::state::attach_question_poll(&conn, "qs", "poll-s", 62).expect("poll");
+        let telegram = test_daemon_config().telegram.expect("telegram");
+        let _probe = crate::telegram::api::outbound_probe::arm_acting(|| {});
+        assert_eq!(
+            finalize_settled_question_messages(
+                &conn,
+                &telegram,
+                base + 1_000,
+                Duration::from_secs(1)
+            )
+            .expect("open"),
+            0,
+            "an open question is left alone"
+        );
+        // The tapped (used) button is not the one the outcome rides on.
+        let used: String = conn
+            .query_row(
+                "SELECT MIN(callback_id) FROM telegram_callback_routes WHERE question_id = 'qs'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("min");
+        mark_telegram_callback_route_used(&conn, &used, base + 1_500).expect("used");
+        crate::state::record_question_answer(&conn, "qs", "乙", base + 2_000).expect("answer");
+        assert_eq!(
+            finalize_settled_question_messages(
+                &conn,
+                &telegram,
+                base + 3_000,
+                Duration::from_secs(1)
+            )
+            .expect("close"),
+            1
+        );
+        let sent = crate::telegram::api::outbound_probe::sent();
+        let methods: Vec<&str> = sent.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(methods, ["editMessageReplyMarkup", "stopPoll"], "{sent:?}");
+        assert_eq!(sent[0].1["message_id"], 61);
+        assert_eq!(
+            sent[0].1["reply_markup"]["inline_keyboard"][0][0]["text"],
+            "✅ 已作答：乙"
+        );
+        assert_ne!(
+            sent[0].1["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            format!("claude:{used}")
+        );
+        assert_eq!(sent[1].1["message_id"], 62);
+        assert_eq!(
+            finalize_settled_question_messages(
+                &conn,
+                &telegram,
+                base + 4_000,
+                Duration::from_secs(1)
+            )
+            .expect("again"),
+            0,
+            "closed once"
+        );
+    }
+
+    /// Sol v0.2.21 r1: a vote on a poll that was never registered (its send
+    /// timed out) is answered, not dropped silently.
+    #[test]
+    fn a_vote_on_an_unknown_poll_is_told_to_reply() {
+        let _guard = crate::state::test_env_lock();
+        let config = test_daemon_config();
+        let telegram = config.telegram.clone().expect("telegram");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let user: i64 = telegram
+            .allowed_user_id
+            .as_deref()
+            .unwrap_or(&telegram.chat_id)
+            .parse()
+            .expect("numeric id");
+        let vote = json!({ "poll_id": "lost", "user": { "id": user }, "option_ids": [0] });
+        let result = answer_question_poll(&conn, &vote, &telegram, 2000, Duration::from_secs(1))
+            .expect("vote");
+        assert_eq!(result["action"], "telegram_poll_unknown", "{result}");
+        assert!(result["notice"]
+            .as_str()
+            .expect("notice")
+            .contains("没有记下"));
+    }
+
+    /// Sol v0.2.21 r1: closing a settled question's messages that fails
+    /// transiently is retried by a later sweep, not marked done.
+    #[test]
+    fn a_transient_close_failure_is_retried_later() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = vec!["甲".to_string(), "乙".to_string()];
+        let base = 1_800_000_000_000u64;
+        crate::state::create_pending_question(
+            &conn,
+            "qt",
+            "sess-x",
+            "选？",
+            &options,
+            false,
+            base,
+            base + 600_000,
+        )
+        .expect("create");
+        crate::state::attach_question_poll(&conn, "qt", "poll-t", 80).expect("poll");
+        crate::state::record_question_answer(&conn, "qt", "甲", base + 1_000).expect("answer");
+        let telegram = test_daemon_config().telegram.expect("telegram");
+        {
+            let _down = crate::telegram::api::outbound_probe::arm_failing();
+            finalize_settled_question_messages(
+                &conn,
+                &telegram,
+                base + 2_000,
+                Duration::from_secs(1),
+            )
+            .expect("try");
+        }
+        assert!(!crate::state::question_finalized(&conn, "qt").expect("not yet"));
+        let _up = crate::telegram::api::outbound_probe::arm_acting(|| {});
+        assert_eq!(
+            finalize_settled_question_messages(
+                &conn,
+                &telegram,
+                base + 3_000,
+                Duration::from_secs(1)
+            )
+            .expect("backoff"),
+            0,
+            "waits before retrying"
+        );
+        assert_eq!(
+            finalize_settled_question_messages(
+                &conn,
+                &telegram,
+                base + 2_000 + crate::state::FINALIZE_RETRY_MS,
+                Duration::from_secs(1)
+            )
+            .expect("retry"),
+            1
+        );
+        assert!(crate::state::question_finalized(&conn, "qt").expect("done"));
+        assert!(telegram_error_is_final(
+            "Telegram API stopPoll request failed: http status: 400"
+        ));
+        assert!(!telegram_error_is_final(
+            "Telegram API stopPoll request failed: timeout"
+        ));
+    }
+
+    /// Sol v0.2.21 r3: a batch's「提交已答的」message hangs on its anchor
+    /// row but closes only once the WHOLE batch has settled.
+    #[test]
+    fn batch_messages_close_only_when_the_whole_batch_settles() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = vec!["甲".to_string(), "乙".to_string()];
+        let base = 1_800_000_000_000u64;
+        for (id, seq) in [("qb0", 0usize), ("qb1", 1)] {
+            crate::state::create_pending_question(
+                &conn,
+                id,
+                "sess-f",
+                "选？",
+                &options,
+                false,
+                base,
+                base + 600_000,
+            )
+            .expect("create");
+            crate::state::set_question_batch(&conn, id, "toolu-c", seq, 2).expect("batch");
+            crate::approvals::question_answer_buttons(&conn, "999", "sess-f", id, &options, base)
+                .expect("buttons");
+            conn.execute(
+                "UPDATE telegram_callback_routes SET message_id = ?2 WHERE question_id = ?1",
+                rusqlite::params![id, if seq == 0 { 110 } else { 111 }],
+            )
+            .expect("sent");
+        }
+        crate::approvals::batch_submit_event(
+            &conn, "999", "sess-f", "toolu-c", "qb0", "提交", None, "k", base,
+        )
+        .expect("submit event");
+        conn.execute(
+            "UPDATE telegram_callback_routes SET message_id = 112
+             WHERE action = 'submit_question_batch'",
+            [],
+        )
+        .expect("sent");
+        let telegram = test_daemon_config().telegram.expect("telegram");
+        let _probe = crate::telegram::api::outbound_probe::arm_acting(|| {});
+        let edited = || -> Vec<i64> {
+            crate::telegram::api::outbound_probe::sent()
+                .iter()
+                .filter(|(m, _)| m == "editMessageReplyMarkup")
+                .filter_map(|(_, p)| p["message_id"].as_i64())
+                .collect()
+        };
+        crate::state::record_question_answer(&conn, "qb0", "甲", base + 1_000).expect("answer 0");
+        finalize_settled_question_messages(&conn, &telegram, base + 2_000, Duration::from_secs(1))
+            .expect("first");
+        assert_eq!(edited(), vec![110], "only the anchor's own buttons");
+        crate::state::record_question_answer(&conn, "qb1", "乙", base + 3_000).expect("answer 1");
+        finalize_settled_question_messages(&conn, &telegram, base + 4_000, Duration::from_secs(1))
+            .expect("second");
+        assert_eq!(
+            edited(),
+            vec![110, 111, 112],
+            "the batch message closes last"
+        );
+    }
+
+    /// Sol v0.2.21 r3: a typed reply that re-stages a single-select tab
+    /// moves the ✅ on its message.
+    #[test]
+    fn a_typed_reply_moves_the_single_select_tick() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        seed_interactive_batch(&conn, &[("qy0", 0), ("qy1", 1)], 2);
+        crate::approvals::question_answer_buttons(
+            &conn,
+            "999",
+            "sess-win",
+            "qy0",
+            &["甲".to_string(), "乙".to_string()],
+            1000,
+        )
+        .expect("buttons");
+        conn.execute(
+            "UPDATE telegram_callback_routes SET message_id = 120 WHERE question_id = 'qy0'",
+            [],
+        )
+        .expect("sent");
+        inject_native_attach_answer(&conn, "qy0", "甲", 2000).expect("tap A");
+        inject_native_attach_answer(&conn, "qy0", "B", 2100).expect("text B");
+        let telegram = test_daemon_config().telegram.expect("telegram");
+        let _probe = crate::telegram::api::outbound_probe::arm_acting(|| {});
+        redraw_question_checkboxes(&conn, &telegram, "qy0", 2200, Duration::from_secs(1))
+            .expect("redraw");
+        let sent = crate::telegram::api::outbound_probe::sent();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let texts: Vec<&str> = sent[0].1["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .flat_map(|row| row.as_array().expect("row").iter())
+            .map(|b| b["text"].as_str().expect("text"))
+            .collect();
+        assert_eq!(texts, ["🔴A 甲", "✅B 乙"]);
+    }
+
+    /// Sol v0.2.21 r4: closing resumes after the last closed message, and a
+    /// batch whose last row has no message of its own still closes its
+    /// 「提交已答的」 message once every row has settled.
+    #[test]
+    fn closing_resumes_per_message_and_batches_close_without_own_messages() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = vec!["甲".to_string(), "乙".to_string()];
+        let base = 1_800_000_000_000u64;
+        for (id, seq) in [("qr0", 0usize), ("qr1", 1)] {
+            crate::state::create_pending_question(
+                &conn,
+                id,
+                "sess-f",
+                "选？",
+                &options,
+                true,
+                base,
+                base + 600_000,
+            )
+            .expect("create");
+            crate::state::set_question_batch(&conn, id, "toolu-r", seq, 2).expect("batch");
+        }
+        // qr0: a keyboard (130) and a poll (131); qr1: nothing of its own
+        // (its poll never went out).
+        crate::approvals::question_answer_buttons(&conn, "999", "sess-f", "qr0", &options, base)
+            .expect("buttons");
+        conn.execute(
+            "UPDATE telegram_callback_routes SET message_id = 130 WHERE question_id = 'qr0'",
+            [],
+        )
+        .expect("sent");
+        crate::state::attach_question_poll(&conn, "qr0", "poll-r", 131).expect("poll");
+        crate::approvals::batch_submit_event(
+            &conn, "999", "sess-f", "toolu-r", "qr0", "提交", None, "k", base,
+        )
+        .expect("submit event");
+        conn.execute(
+            "UPDATE telegram_callback_routes SET message_id = 132
+             WHERE action = 'submit_question_batch'",
+            [],
+        )
+        .expect("sent");
+        crate::state::mark_question_message_closed(&conn, 130, "keyboard", base).expect("done");
+        let telegram = test_daemon_config().telegram.expect("telegram");
+        let _probe = crate::telegram::api::outbound_probe::arm_acting(|| {});
+        crate::state::record_question_answer(&conn, "qr0", "甲", base + 1_000).expect("answer 0");
+        finalize_settled_question_messages(&conn, &telegram, base + 2_000, Duration::from_secs(1))
+            .expect("first");
+        let calls = || -> Vec<(String, i64)> {
+            crate::telegram::api::outbound_probe::sent()
+                .iter()
+                .map(|(m, p)| (m.clone(), p["message_id"].as_i64().unwrap_or_default()))
+                .collect()
+        };
+        assert_eq!(
+            calls(),
+            vec![("stopPoll".to_string(), 131)],
+            "the already-closed keyboard is skipped; the batch message waits"
+        );
+        crate::state::record_question_answer(&conn, "qr1", "乙", base + 3_000).expect("answer 1");
+        finalize_settled_question_messages(&conn, &telegram, base + 4_000, Duration::from_secs(1))
+            .expect("second");
+        assert_eq!(
+            calls().last(),
+            Some(&("editMessageReplyMarkup".to_string(), 132)),
+            "the batch message closes though its last row had none"
+        );
+        finalize_settled_question_messages(&conn, &telegram, base + 5_000, Duration::from_secs(1))
+            .expect("third");
+        assert_eq!(calls().len(), 2, "nothing closed twice");
+    }
+
+    /// Sol v0.2.21 r4: retracting a vote on a fork tab whose injection never
+    /// went in says the answer was not submitted.
+    #[test]
+    fn retracting_an_undelivered_fork_vote_says_nothing_went_in() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = vec!["甲".to_string(), "乙".to_string()];
+        for (id, seq) in [("qf0", 0usize), ("qf1", 1)] {
+            crate::state::create_pending_question(
+                &conn, id, "sess-f", "选？", &options, true, 1000, 9_000_000,
+            )
+            .expect("create");
+            crate::state::set_question_batch(&conn, id, "toolu-f", seq, 2).expect("batch");
+            crate::state::mark_question_native_attach(&conn, id).expect("native");
+        }
+        let notice = record_poll_vote(&conn, "qf0", &[], 2000).expect("retract");
+        assert!(notice.contains("没能送进电脑"), "{notice}");
+        // Sol v0.2.21 r6: this tab went in, the batch is still the phone's.
+        conn.execute(
+            "UPDATE pending_questions SET delivered_at = 2100 WHERE question_id = 'qf0'",
+            [],
+        )
+        .expect("delivered");
+        let notice = record_poll_vote(&conn, "qf0", &[], 2200).expect("retract delivered");
+        assert!(notice.contains("其余题照常作答"), "{notice}");
+    }
+
+    /// v0.2.21: the picked single-select option is ticked on its message.
+    #[test]
+    fn the_picked_option_is_ticked_on_its_message() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        seed_interactive_batch(&conn, &[("qk0", 0), ("qk1", 1)], 2);
+        crate::approvals::question_answer_buttons(
+            &conn,
+            "999",
+            "sess-win",
+            "qk0",
+            &["甲".to_string(), "乙".to_string()],
+            1000,
+        )
+        .expect("buttons");
+        conn.execute(
+            "UPDATE telegram_callback_routes SET message_id = 70 WHERE question_id = 'qk0'",
+            [],
+        )
+        .expect("sent");
+        assert_eq!(
+            chosen_option_keyboard(&conn, "qk0", 70, None, 2000).expect("none"),
+            None,
+            "nothing picked yet"
+        );
+        assert!(crate::state::stage_batch_answer(&conn, "qk0", "乙", 2000).expect("stage"));
+        let keyboard = chosen_option_keyboard(&conn, "qk0", 70, None, 2100)
+            .expect("kb")
+            .expect("some");
+        let texts: Vec<&str> = keyboard["inline_keyboard"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .flat_map(|row| row.as_array().expect("row").iter())
+            .map(|b| b["text"].as_str().expect("text"))
+            .collect();
+        assert_eq!(texts, ["🔴A 甲", "✅B 乙"]);
+        // A closed message never gets its options back.
+        crate::state::mark_question_finalized(&conn, "qk0", 2200).expect("closed");
+        assert_eq!(
+            chosen_option_keyboard(&conn, "qk0", 70, None, 2300).expect("closed"),
+            None
+        );
+    }
+
+    /// Sol v0.2.21 r1: with two same-label options, the TAPPED one is ticked.
+    #[test]
+    fn the_tapped_one_of_two_same_label_options_is_ticked() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = vec!["同名".to_string(), "同名".to_string()];
+        crate::state::create_pending_question(
+            &conn, "qn", "sess-f", "选？", &options, false, 1000, 9_000_000,
+        )
+        .expect("create");
+        crate::state::set_question_batch(&conn, "qn", "toolu-n", 0, 2).expect("batch");
+        crate::state::mark_question_native_attach(&conn, "qn").expect("native");
+        crate::approvals::question_answer_buttons(&conn, "999", "sess-f", "qn", &options, 1000)
+            .expect("buttons");
+        conn.execute(
+            "UPDATE telegram_callback_routes SET message_id = 90 WHERE question_id = 'qn'",
+            [],
+        )
+        .expect("sent");
+        let second: String = conn
+            .query_row(
+                "SELECT callback_id FROM telegram_callback_routes WHERE question_id = 'qn'
+                 ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("second");
+        let keyboard = chosen_option_keyboard(&conn, "qn", 90, Some(&second), 2000)
+            .expect("kb")
+            .expect("some");
+        let texts: Vec<&str> = keyboard["inline_keyboard"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .flat_map(|row| row.as_array().expect("row").iter())
+            .map(|b| b["text"].as_str().expect("text"))
+            .collect();
+        assert_eq!(texts, ["🔴A 同名", "✅B 同名"]);
+    }
+
     fn take_xtest_steps() -> Vec<String> {
         crate::fork_dialog::XTEST_STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()))
     }
@@ -9878,7 +10979,8 @@ mod tests {
         crate::state::set_checked_options(&conn, "qr", &[0, 2]).expect("typed A,C");
         let telegram = test_daemon_config().telegram.expect("telegram");
         let _probe = crate::telegram::api::outbound_probe::arm_acting(|| {});
-        redraw_question_checkboxes(&conn, &telegram, "qr", Duration::from_secs(1)).expect("redraw");
+        redraw_question_checkboxes(&conn, &telegram, "qr", 2000, Duration::from_secs(1))
+            .expect("redraw");
         let sent = crate::telegram::api::outbound_probe::sent();
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert_eq!(sent[0].0, "editMessageReplyMarkup");

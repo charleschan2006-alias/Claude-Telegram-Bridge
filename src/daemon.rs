@@ -1028,6 +1028,8 @@ struct CycleLanes {
 }
 
 const TELEGRAM_UPDATES_MIN_INTERVAL_MS: u64 = 250;
+/// How long after the last phone update the daemon keeps waking fast.
+const PHONE_ACTIVE_WINDOW_MS: u64 = 60_000;
 const FULL_SYNC_MIN_INTERVAL_MS: u64 = 1500;
 
 fn daemon_cycle(
@@ -1230,6 +1232,23 @@ fn daemon_cycle_lanes(
                 json!({
                     "ok": false,
                     "action": "batch_reminder_error",
+                    "error": format!("{error:#}")
+                })
+            );
+        }
+    }
+    // Settled questions close their phone messages (v0.2.21): buttons become
+    // one line saying how it ended, polls stop taking votes. Every wake: the
+    // user is looking at the phone right after a submit.
+    if let Some(telegram) = config.telegram.as_ref() {
+        if let Err(error) =
+            crate::telegram::finalize_settled_question_messages(conn, telegram, now, timeout)
+        {
+            println!(
+                "{}",
+                json!({
+                    "ok": false,
+                    "action": "question_finalize_error",
                     "error": format!("{error:#}")
                 })
             );
@@ -1831,6 +1850,7 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
     );
     let watch_rx = start_claude_watch_receiver().ok();
     let mut last_prune_at = 0u64;
+    let mut last_phone_activity_at = 0u64;
     let mut last_updates_at = 0u64;
     let mut last_sync_at = 0u64;
     // A spool/projects wake means a hook just fired: the next cycle must run
@@ -1925,6 +1945,14 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
             // Ten JSON lines a second would drown the log in idle ticks:
             // fast lanes stay silent unless something actually happened.
             Ok(result) => {
+                if result
+                    .pointer("/telegramUpdates/seen")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+                {
+                    last_phone_activity_at = now;
+                }
                 let noteworthy = lanes.full_sync
                     || result.get("enqueued").and_then(Value::as_u64).unwrap_or(0) > 0
                     || result
@@ -1952,10 +1980,18 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
                 );
             }
         }
+        // While the user is tapping on the phone, wake at the Telegram
+        // lane's own floor (v0.2.21): the next tap is picked up within ~a
+        // quarter second instead of up to the full poll interval.
+        let wait = if now.saturating_sub(last_phone_activity_at) < PHONE_ACTIVE_WINDOW_MS {
+            poll_interval.min(TELEGRAM_UPDATES_MIN_INTERVAL_MS)
+        } else {
+            poll_interval
+        };
         woken = match watch_rx.as_ref() {
-            Some(rx) => rx.recv_timeout(Duration::from_millis(poll_interval)),
+            Some(rx) => rx.recv_timeout(Duration::from_millis(wait)),
             None => {
-                thread::sleep(Duration::from_millis(poll_interval));
+                thread::sleep(Duration::from_millis(wait));
                 false
             }
         };

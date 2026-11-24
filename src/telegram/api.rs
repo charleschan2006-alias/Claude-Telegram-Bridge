@@ -157,7 +157,7 @@ pub(crate) fn telegram_get_updates(
     body.insert("timeout".to_string(), json!(timeout_seconds));
     body.insert(
         "allowed_updates".to_string(),
-        json!(["message", "callback_query"]),
+        json!(["message", "callback_query", "poll_answer"]),
     );
     telegram_api_post(bot_token, "getUpdates", &Value::Object(body), timeout)
 }

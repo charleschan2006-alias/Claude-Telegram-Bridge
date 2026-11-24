@@ -55,6 +55,9 @@ const TELEGRAM_BATCH_SUBMIT_HINT: &str = "👆 点按钮只提交已答的题（
 /// A multi-select question with phone checkboxes (v0.2.20).
 const TELEGRAM_CHECKBOX_HINT: &str =
     "☑️ 多选题：点选项勾选或取消，选好后点「提交这题」。也可以直接回复字母，如 A,C。";
+/// A multi-select question sent with a Telegram poll under it (v0.2.21).
+const TELEGRAM_POLL_HINT: &str =
+    "☑️ 多选题：在下面的投票里勾选（可多选），点「投票」提交。整组还没送进电脑前，可以撤回投票重选；已提交的撤回无效。也可以直接回复字母，如 A,C。";
 const TELEGRAM_NOTIFY_ONLY_QUESTION_HINT: &str =
     "🖥️ 这一题手机答不了，请到电脑的对话框里作答（回复本消息不会作为答案）。";
 /// Neither confirmed: the session has no verified live socket, or reading it
@@ -106,6 +109,10 @@ pub(crate) struct PreparedTelegramDelivery {
     /// Same, for an approval request — used to catch a text reply that was
     /// meant as an answer and tell the user to use the buttons.
     pub(crate) approval_id: Option<String>,
+    /// A multi-select question's poll (v0.2.21): the `sendPoll` payload, sent
+    /// right after the text so the ticks happen on the phone and one vote
+    /// submits them.
+    pub(crate) poll: Option<Value>,
     /// A question message the phone CANNOT answer (a multi-question tab that
     /// is multi-select / free text, or an interactive session's own dialog):
     /// delivery registers no reply route for it, so a reply is never fed into
@@ -155,6 +162,9 @@ fn telegram_event_reply_hint(event_type: &str, event: &Value) -> &'static str {
     }
     if event.get("batchSubmit").and_then(Value::as_bool) == Some(true) {
         return TELEGRAM_BATCH_SUBMIT_HINT;
+    }
+    if event.get("poll").is_some_and(|poll| !poll.is_null()) {
+        return TELEGRAM_POLL_HINT;
     }
     if event.get("checkboxes").and_then(Value::as_bool) == Some(true) {
         return TELEGRAM_CHECKBOX_HINT;
@@ -376,6 +386,79 @@ fn compact_telegram_file_reference(candidate: &str) -> Option<String> {
     }
 }
 
+/// Lay `(text, callback_id)` buttons out in rows: by label width, at most
+/// three per row — or one per row for a checkbox list. Shared by the first
+/// push and every later redraw of a question's keyboard (v0.2.21).
+pub(crate) fn layout_button_rows(buttons: &[(String, String)], one_per_row: bool) -> Vec<Value> {
+    // Layout follows label length, not button count: two or three short
+    // labels read well side by side (two especially), while a long label
+    // gets squeezed until the row stops looking tappable. So pack greedily
+    // within a width budget, at most three per row.
+    let mut rows: Vec<Value> = Vec::new();
+    let mut current_row: Vec<Value> = Vec::new();
+    let mut current_width = 0usize;
+    for (text, callback_id) in buttons {
+        let width = display_width(text);
+        if !current_row.is_empty()
+            && (one_per_row
+                || current_row.len() >= MAX_BUTTONS_PER_ROW
+                || current_width + width > BUTTON_ROW_WIDTH_BUDGET)
+        {
+            rows.push(json!(std::mem::take(&mut current_row)));
+            current_width = 0;
+        }
+        current_row.push(json!({
+            "text": text,
+            "callback_data": format!("claude:{callback_id}")
+        }));
+        current_width += width;
+    }
+    if !current_row.is_empty() {
+        rows.push(json!(current_row));
+    }
+    rows
+}
+
+/// The `sendPoll` payload for a multi-select question (v0.2.21): a regular,
+/// non-anonymous, multiple-answer poll — the bot only hears votes on
+/// non-anonymous polls it sent. Telegram caps the question at 300 and each
+/// option at 100 characters; votes come back as option INDEXES, so cutting a
+/// label short never changes what a vote means.
+fn poll_payload(chat_id: &str, poll: &Value) -> Option<Value> {
+    let question = poll.get("question").and_then(Value::as_str)?;
+    let options: Vec<Value> = poll
+        .get("options")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .enumerate()
+        .map(|(index, label)| {
+            let letter = (b'A' + index as u8) as char;
+            json!({ "text": clip_chars(&format!("{letter} {label}"), 100) })
+        })
+        .collect();
+    if !(2..=10).contains(&options.len()) {
+        return None;
+    }
+    Some(json!({
+        "chat_id": chat_id,
+        "question": clip_chars(question, 300),
+        "options": options,
+        "is_anonymous": false,
+        "allows_multiple_answers": true,
+        "type": "regular"
+    }))
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut clipped: String = text.chars().take(max - 1).collect();
+    clipped.push('…');
+    clipped
+}
+
 pub(crate) fn prepare_telegram_delivery(
     chat_id: &str,
     event: &Value,
@@ -436,11 +519,9 @@ pub(crate) fn prepare_telegram_delivery(
         // labels read well side by side (two especially), while a long label
         // gets squeezed until the row stops looking tappable. So pack
         // greedily within a width budget, at most three per row.
-        let mut rows: Vec<Value> = Vec::new();
-        let mut current_row: Vec<Value> = Vec::new();
-        let mut current_width = 0usize;
         // Checkboxes read as a list: one per row, the submit button last.
         let one_per_row = event.get("checkboxes").and_then(Value::as_bool) == Some(true);
+        let mut laid_out: Vec<(String, String)> = Vec::new();
         for button in &buttons {
             let (Some(text), Some(callback_id)) = (
                 button.get("text").and_then(Value::as_str),
@@ -448,20 +529,7 @@ pub(crate) fn prepare_telegram_delivery(
             ) else {
                 continue;
             };
-            let width = display_width(text);
-            if !current_row.is_empty()
-                && (one_per_row
-                    || current_row.len() >= MAX_BUTTONS_PER_ROW
-                    || current_width + width > BUTTON_ROW_WIDTH_BUDGET)
-            {
-                rows.push(json!(std::mem::take(&mut current_row)));
-                current_width = 0;
-            }
-            current_row.push(json!({
-                "text": text,
-                "callback_data": format!("claude:{callback_id}")
-            }));
-            current_width += width;
+            laid_out.push((text.to_string(), callback_id.to_string()));
             if let Some(action) = button
                 .get("action")
                 .and_then(Value::as_str)
@@ -489,9 +557,7 @@ pub(crate) fn prepare_telegram_delivery(
                 });
             }
         }
-        if !current_row.is_empty() {
-            rows.push(json!(current_row));
-        }
+        let rows = layout_button_rows(&laid_out, one_per_row);
         if !rows.is_empty() {
             // Buttons ride on the LAST chunk so they sit under the full text.
             if let Some(last) = payloads.last_mut().and_then(Value::as_object_mut) {
@@ -507,11 +573,16 @@ pub(crate) fn prepare_telegram_delivery(
     // carry no buttons: that dialog can only be answered in its terminal.
     // Only `approval_request` events (raised by the PreToolUse gate, which is
     // blocking on the answer) get an inline keyboard.
+    let poll = event
+        .get("poll")
+        .filter(|poll| !poll.is_null())
+        .and_then(|poll| poll_payload(chat_id, poll));
     Ok(PreparedTelegramDelivery {
         payloads,
         thread_id,
         event_id,
         callback_routes,
+        poll,
         question_id: event
             .get("questionId")
             .and_then(Value::as_str)
@@ -993,6 +1064,37 @@ pub(crate) fn telegram_new_thread_confirmation_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.2.21: a multi-select question ships a regular, non-anonymous,
+    /// multiple-answer poll with lettered options, and the poll hint.
+    #[test]
+    fn a_multi_select_question_carries_a_poll() {
+        let event = json!({
+            "type": "question_request",
+            "threadId": "sess-p",
+            "questionId": "qp",
+            "observedAt": 1,
+            "eventKey": "question:qp",
+            "lastPreview": "配料？",
+            "buttons": [],
+            "checkboxes": false,
+            "poll": { "question": "第 1/2 问：配料？", "options": ["奶酪", "火腿"] }
+        });
+        let prepared = prepare_telegram_delivery("999", &event).expect("prepared");
+        let poll = prepared.poll.expect("poll");
+        assert_eq!(poll["question"], "第 1/2 问：配料？");
+        assert_eq!(
+            poll["options"],
+            json!([{ "text": "A 奶酪" }, { "text": "B 火腿" }])
+        );
+        assert_eq!(poll["is_anonymous"], false);
+        assert_eq!(poll["allows_multiple_answers"], true);
+        assert!(prepared.payloads[0]["text"]
+            .as_str()
+            .expect("text")
+            .contains("点「投票」提交"));
+        assert_eq!(clip_chars(&"长".repeat(400), 300).chars().count(), 300);
+    }
 
     #[test]
     fn telegram_message_payload_preserves_full_multiline_claude_body() {

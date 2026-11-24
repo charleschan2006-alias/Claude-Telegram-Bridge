@@ -811,6 +811,12 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
           answer TEXT,
           answered_at INTEGER
         );
+        CREATE TABLE IF NOT EXISTS closed_question_messages (
+          message_id INTEGER NOT NULL,
+          kind TEXT NOT NULL,
+          closed_at INTEGER NOT NULL,
+          PRIMARY KEY(message_id, kind)
+        );
         CREATE TABLE IF NOT EXISTS dialog_messages (
           chat_id TEXT NOT NULL,
           message_id INTEGER NOT NULL,
@@ -994,6 +1000,18 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     // the injection returns): a PostToolUse or sweep in that window must not
     // read the batch as answered at the PC (Sol r10).
     ensure_column(conn, "pending_questions", "phone_typing_at", "INTEGER")?;
+    // A multi-select question goes to the phone as a Telegram poll (v0.2.21):
+    // ticks change locally on the phone and the vote submits them at once.
+    ensure_column(conn, "pending_questions", "poll_id", "TEXT")?;
+    ensure_column(conn, "pending_questions", "poll_message_id", "INTEGER")?;
+    // The question's phone messages were closed (poll stopped, buttons
+    // replaced by a one-line outcome) once it settled (v0.2.21).
+    ensure_column(conn, "pending_questions", "finalized_at", "INTEGER")?;
+    // The ticks the poll's last vote set: a retracted vote only takes back
+    // what the poll itself put there (Sol v0.2.21 r1).
+    ensure_column(conn, "pending_questions", "poll_vote_json", "TEXT")?;
+    // Last time closing the messages failed transiently (retried later).
+    ensure_column(conn, "pending_questions", "finalize_tried_at", "INTEGER")?;
     ensure_column(conn, "pending_prompts", "transcript_bytes", "INTEGER")?;
     ensure_column(conn, "pending_prompts", "notification_type", "TEXT")?;
     // WHICH INSTANCE of a prompt this row is. The id is `notify:{received_at}`
@@ -4613,8 +4631,13 @@ pub(crate) fn set_checked_options(
     let mut checked = checked.to_vec();
     checked.sort_unstable();
     checked.dedup();
+    // Any write of the ticks forgets which poll vote set them (Sol v0.2.21
+    // r2): only the poll path records its vote again, right after — so a
+    // retraction can tell "still the poll's answer" from "rewritten since,
+    // even back to the same set".
     let changed = conn.execute(
-        "UPDATE pending_questions SET checked_json = ?2, staged_answer = NULL
+        "UPDATE pending_questions SET checked_json = ?2, staged_answer = NULL,
+                poll_vote_json = NULL
          WHERE question_id = ?1 AND answer IS NULL AND delivered_at IS NULL
            AND submitted_at IS NULL",
         params![question_id, serde_json::to_string(&checked)?],
@@ -4660,15 +4683,287 @@ pub(crate) fn question_checkbox_route(
     conn: &Connection,
     question_id: &str,
 ) -> Result<Option<(String, i64)>> {
+    question_route_message(conn, question_id, "toggle_option")
+}
+
+/// The newest sent message of `question_id` carrying an `action` button:
+/// one such route and its message.
+pub(crate) fn question_route_message(
+    conn: &Connection,
+    question_id: &str,
+    action: &str,
+) -> Result<Option<(String, i64)>> {
     Ok(conn
         .query_row(
             "SELECT callback_id, message_id FROM telegram_callback_routes
-             WHERE question_id = ?1 AND action = 'toggle_option' AND message_id IS NOT NULL
+             WHERE question_id = ?1 AND action = ?2 AND message_id IS NOT NULL
              ORDER BY created_at DESC, rowid DESC LIMIT 1",
-            params![question_id],
+            params![question_id, action],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?)
+}
+
+/// The poll that carries `question_id` on the phone (v0.2.21).
+pub(crate) fn attach_question_poll(
+    conn: &Connection,
+    question_id: &str,
+    poll_id: &str,
+    message_id: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_questions SET poll_id = ?2, poll_message_id = ?3 WHERE question_id = ?1",
+        params![question_id, poll_id, message_id],
+    )?;
+    Ok(())
+}
+
+/// Which question a vote belongs to.
+pub(crate) fn question_for_poll(conn: &Connection, poll_id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT question_id FROM pending_questions WHERE poll_id = ?1",
+            params![poll_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// A settled question whose phone messages are still open: answered (by
+/// either side), won by the PC, or past its deadline — and not finalized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SettledQuestion {
+    pub(crate) question_id: String,
+    /// The recorded answer (`None` when expired or not recorded yet).
+    pub(crate) answer: Option<String>,
+    pub(crate) pc_won: bool,
+    pub(crate) expired: bool,
+    pub(crate) poll_message_id: Option<i64>,
+    /// `(message_id, any callback_id on it)` for each keyboard message.
+    pub(crate) keyboards: Vec<(i64, String)>,
+}
+
+/// Only questions asked at or after `since` (older messages are left as
+/// they are — this is for the live conversation, not history).
+pub(crate) fn settled_unfinalized_questions(
+    conn: &Connection,
+    now: u64,
+    since: u64,
+) -> Result<Vec<SettledQuestion>> {
+    let now_sql = to_sql_i64(now)?;
+    let mut stmt = conn.prepare(
+        "SELECT question_id, answer, pc_won_at IS NOT NULL, expires_at, poll_message_id
+         FROM pending_questions
+         WHERE finalized_at IS NULL
+           AND created_at >= ?2
+           AND (finalize_tried_at IS NULL OR finalize_tried_at <= ?3)
+           AND (answer IS NOT NULL OR pc_won_at IS NOT NULL OR expires_at < ?1)
+           AND (poll_message_id IS NOT NULL OR EXISTS (
+                 SELECT 1 FROM telegram_callback_routes r
+                 WHERE r.question_id = pending_questions.question_id
+                   AND r.message_id IS NOT NULL))
+         ORDER BY created_at ASC
+         LIMIT 20",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![
+                now_sql,
+                to_sql_i64(since)?,
+                to_sql_i64(now.saturating_sub(FINALIZE_RETRY_MS))?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut settled = Vec::new();
+    for (question_id, answer, pc_won, expires_at, poll_message_id) in rows {
+        // The question's OWN buttons. A batch's「提交已答的」/ reminder
+        // messages hang on its anchor row but belong to the whole batch
+        // (Sol v0.2.21 r3): `settled_batch_messages` closes them once EVERY
+        // row has settled, whichever rows have messages of their own.
+        // The outcome button rides on a route that still answers a tap
+        // (Sol v0.2.21 r6): an unused one if there is any, so a tap on it
+        // gets the question's status, not "already handled".
+        let mut stmt = conn.prepare(
+            "SELECT message_id,
+                    COALESCE(MIN(CASE WHEN used_at IS NULL THEN callback_id END),
+                             MIN(callback_id))
+             FROM telegram_callback_routes
+             WHERE question_id = ?1 AND message_id IS NOT NULL
+               AND action != 'submit_question_batch'
+             GROUP BY message_id ORDER BY message_id",
+        )?;
+        let keyboards = stmt
+            .query_map(params![question_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let expired = answer.as_deref() == Some(QUESTION_EXPIRED)
+            || (answer.is_none()
+                && timestamp_to_millis(now) > timestamp_to_millis(from_sql_i64(expires_at)?));
+        settled.push(SettledQuestion {
+            question_id,
+            answer: answer.filter(|a| a != QUESTION_EXPIRED),
+            pc_won,
+            expired,
+            poll_message_id,
+            keyboards,
+        });
+    }
+    Ok(settled)
+}
+
+/// The「提交已答的」/ reminder messages of batches that have fully settled
+/// (every row answered, won by the PC, or past its deadline) and are not
+/// closed yet: `(message_id, callback_id, pc_won)`. Independent of the rows'
+/// own closing, so a batch whose last row has no message of its own (its
+/// poll failed, it was answered by a reply) still closes (Sol v0.2.21 r4).
+pub(crate) fn settled_batch_messages(
+    conn: &Connection,
+    now: u64,
+    since: u64,
+) -> Result<Vec<(i64, String, bool)>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.message_id, MIN(r.callback_id), MAX(me.pc_won_at IS NOT NULL)
+         FROM telegram_callback_routes r
+         JOIN pending_questions me ON me.question_id = r.question_id
+         WHERE r.action = 'submit_question_batch' AND r.message_id IS NOT NULL
+           AND me.batch_id IS NOT NULL AND r.created_at >= ?2
+           AND NOT EXISTS (SELECT 1 FROM closed_question_messages c
+                           WHERE c.message_id = r.message_id AND c.kind = 'keyboard')
+           AND NOT EXISTS (
+             SELECT 1 FROM pending_questions o
+             WHERE o.batch_id = me.batch_id AND o.thread_id = me.thread_id
+               AND o.answer IS NULL AND o.pc_won_at IS NULL AND o.expires_at >= ?1)
+         GROUP BY r.message_id ORDER BY r.message_id LIMIT 20",
+    )?;
+    let rows = stmt
+        .query_map(params![to_sql_i64(now)?, to_sql_i64(since)?], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Has this message (`kind`: `keyboard` / `poll`) been closed already?
+pub(crate) fn question_message_closed(
+    conn: &Connection,
+    message_id: i64,
+    kind: &str,
+) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM closed_question_messages WHERE message_id = ?1 AND kind = ?2",
+            params![message_id, kind],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Remember that a message was closed (or can never be), so a sweep cut
+/// short by its budget resumes after it instead of starting over.
+pub(crate) fn mark_question_message_closed(
+    conn: &Connection,
+    message_id: i64,
+    kind: &str,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO closed_question_messages (message_id, kind, closed_at)
+         VALUES (?1, ?2, ?3)",
+        params![message_id, kind, to_sql_i64(now)?],
+    )?;
+    Ok(())
+}
+
+/// How long a question whose messages could not be closed (a transient
+/// Telegram failure) waits before the sweep tries again.
+pub(crate) const FINALIZE_RETRY_MS: u64 = 30_000;
+
+pub(crate) fn mark_question_finalize_failed(
+    conn: &Connection,
+    question_id: &str,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_questions SET finalize_tried_at = ?2 WHERE question_id = ?1",
+        params![question_id, to_sql_i64(now)?],
+    )?;
+    Ok(())
+}
+
+/// Have the question's phone messages been closed? (`true` for no row.)
+pub(crate) fn question_finalized(conn: &Connection, question_id: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT finalized_at IS NOT NULL FROM pending_questions WHERE question_id = ?1",
+            params![question_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(true))
+}
+
+/// Remember / read the ticks the poll's last vote set.
+pub(crate) fn set_poll_vote(conn: &Connection, question_id: &str, ticked: &[usize]) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_questions SET poll_vote_json = ?2 WHERE question_id = ?1",
+        params![question_id, serde_json::to_string(ticked)?],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn poll_vote(conn: &Connection, question_id: &str) -> Result<Option<Vec<usize>>> {
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT poll_vote_json FROM pending_questions WHERE question_id = ?1",
+            params![question_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(raw
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Vec<usize>>(&raw).ok()))
+}
+
+pub(crate) fn mark_question_finalized(
+    conn: &Connection,
+    question_id: &str,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_questions SET finalized_at = ?2 WHERE question_id = ?1",
+        params![question_id, to_sql_i64(now)?],
+    )?;
+    Ok(())
+}
+
+/// The routes of one keyboard message of a question, in button order:
+/// `(callback_id, action, answer)`.
+pub(crate) fn message_question_routes(
+    conn: &Connection,
+    question_id: &str,
+    message_id: i64,
+) -> Result<Vec<(String, String, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT callback_id, action, answer FROM telegram_callback_routes
+         WHERE question_id = ?1 AND message_id = ?2
+         ORDER BY created_at ASC, rowid ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![question_id, message_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// Has `question_id`'s batch been submitted (or handed to the PC)? `false`
