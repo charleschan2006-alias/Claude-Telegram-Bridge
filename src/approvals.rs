@@ -1138,12 +1138,8 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
             &gate_clock,
             terminal_watch.as_mut(),
         )? {
-            WindowOutcome::Settled(value, via) => {
-                banner.paint_note(match via {
-                    SettledVia::Decision => "✔ 审批已有决定（手机按钮或已录决定）",
-                    SettledVia::HandBack => "↩ 已交还本终端，对话框即将弹出",
-                    SettledVia::TerminalAnswer => "✔ 本终端对话框已作答，手机按钮已收回",
-                });
+            WindowOutcome::Settled(value, _via) => {
+                banner.finish();
                 return Ok(value);
             }
             // This round ran out with nobody answering. Renewal is for the
@@ -1158,7 +1154,7 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
                     && away_mode_active()
                     && std::time::Instant::now() < renewal_deadline;
                 if !renewable {
-                    banner.paint_note("⌛ 手机未作答，交还本终端对话框");
+                    banner.finish();
                     return Ok(match kind {
                         // An interactive session still has its own prompt to
                         // fall back on, which is exactly what "no opinion"
@@ -1635,7 +1631,8 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     }
     let phone_answered = |answer: &str| {
         let resolved = resolve_answer(answer, &options);
-        banner.paint_note(&format!("✔ 已由手机作答：{resolved}"));
+        // The receipt lives in the hook's `systemMessage`; the banner goes.
+        banner.finish();
         answered(&questions, &question_raw, &resolved)
     };
     let deadline = std::time::Instant::now() + wait;
@@ -1663,7 +1660,7 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
             )? {
                 Some(answer) => Ok(phone_answered(&answer)),
                 None => {
-                    banner.paint_note("↩ 已交还本终端，对话框即将弹出");
+                    banner.finish();
                     Ok(no_opinion())
                 }
             };
@@ -1676,7 +1673,7 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     )? {
         Some(answer) => Ok(phone_answered(&answer)),
         None => {
-            banner.paint_note("⌛ 手机未作答，交还本终端对话框");
+            banner.finish();
             Ok(no_opinion())
         }
     }
@@ -2152,6 +2149,8 @@ pub(crate) fn run_question_answered_gate<R: Read>(reader: &mut R, now: u64) -> R
 /// for a lost question.
 struct QuestionBanner {
     tty: Option<std::path::PathBuf>,
+    /// Something was written: the closing redraw is owed.
+    painted: std::cell::Cell<bool>,
 }
 
 impl QuestionBanner {
@@ -2160,7 +2159,10 @@ impl QuestionBanner {
         // hidden pty would be writing to nobody and the Telegram window is
         // already the only real dialog.
         if windowless {
-            return Self { tty: None };
+            return Self {
+                tty: None,
+                painted: std::cell::Cell::new(false),
+            };
         }
         let tty = crate::claude::session_tty_path();
         if tty.is_none() {
@@ -2169,11 +2171,15 @@ impl QuestionBanner {
                  the question waits on Telegram"
             );
         }
-        Self { tty }
+        Self {
+            tty,
+            painted: std::cell::Cell::new(false),
+        }
     }
 
     fn write(&self, text: &str) {
         let Some(tty) = &self.tty else { return };
+        self.painted.set(true);
         if let Err(err) = write_bounded(tty, text.as_bytes(), BANNER_WRITE_BUDGET) {
             eprintln!(
                 "tinyctb question-gate: banner write to {} gave up: {err}",
@@ -2209,10 +2215,31 @@ impl QuestionBanner {
             lines.push_str(&format!("\x1b[36m┃ {listed}\x1b[0m\r\n"));
         }
         if multi_select {
-            lines.push_str("\x1b[36m┃ 多选：手机端以逗号分隔回复\x1b[0m\r\n");
+            lines.push_str(
+                "\x1b[36m┃ 多选：手机上在投票里勾选后点「投票」，或回复字母（如 A,C）\x1b[0m\r\n",
+            );
         }
         lines.push_str("\x1b[2m┃ 手机作答，或 /back 收回到本终端作答\x1b[0m\r\n");
         self.write(&lines);
+    }
+
+    /// The wait is over: take what we painted back off the screen (v0.2.25).
+    /// Those bytes are not part of the TUI's own picture, so nothing it draws
+    /// next removes them — the user had to resize the window to clear the
+    /// cyan lines. The same redraw is triggered here, without a keystroke: the
+    /// pty is narrowed by one column and restored, and the TUI repaints the
+    /// whole screen on each SIGWINCH the kernel sends it.
+    fn finish(&self) {
+        let Some(tty) = &self.tty else { return };
+        if !self.painted.replace(false) {
+            return;
+        }
+        if let Err(err) = force_terminal_redraw(tty) {
+            eprintln!(
+                "tinyctb: could not redraw {} after the banner: {err}",
+                tty.display()
+            );
+        }
     }
 
     /// One-line epilogue: the phone answered, or the window is being handed
@@ -2227,6 +2254,55 @@ impl QuestionBanner {
             terminal_safe(note)
         ));
     }
+}
+
+/// Every way out of a gate takes the banner down — an error propagated with
+/// `?` included (Sol v0.2.25 r1). The explicit `finish()` calls run first on
+/// the normal exits; this is the backstop (a no-op once finished).
+impl Drop for QuestionBanner {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// Make the session's TUI repaint its whole screen, as a window resize does:
+/// narrow the pty by one column, give the TUI a moment, restore the size.
+/// The kernel sends SIGWINCH to the tty's foreground process group on each
+/// change. The terminal emulator is not involved (it keeps its own size, and
+/// the pty is back to it at once). No-op on a tty narrower than 2 columns.
+#[cfg(unix)]
+fn force_terminal_redraw(tty: &std::path::Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let device = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(tty)?;
+    let fd = device.as_raw_fd();
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if size.ws_col < 2 {
+        return Ok(());
+    }
+    let mut narrower = size;
+    narrower.ws_col -= 1;
+    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &narrower) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    std::thread::sleep(Duration::from_millis(120));
+    // Restored whatever happens above: never leave the pty a column short.
+    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &size) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn force_terminal_redraw(_tty: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Total time one banner write may spend before giving up. Generous for a
@@ -5547,10 +5623,51 @@ mod tests {
         drop(sentinels);
     }
 
+    /// v0.2.25: the closing redraw narrows a real pty by one column and puts
+    /// it back exactly — never leaves it a column short.
+    #[test]
+    fn the_closing_redraw_restores_the_pty_size() {
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        let mut size = libc::winsize {
+            ws_row: 30,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &size,
+            )
+        };
+        assert_eq!(opened, 0, "openpty");
+        let name = fs::read_link(format!("/proc/self/fd/{slave}")).expect("pts path");
+        force_terminal_redraw(&name).expect("redraw");
+        size = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::ioctl(slave, libc::TIOCGWINSZ, &mut size) },
+            0
+        );
+        assert_eq!((size.ws_row, size.ws_col), (30, 100));
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+        // Not a tty: an error, nothing else.
+        let plain = std::env::temp_dir().join(format!("tinyctb-notty-{}", std::process::id()));
+        fs::write(&plain, "").expect("file");
+        assert!(force_terminal_redraw(&plain).is_err());
+        let _ = fs::remove_file(&plain);
+    }
+
     /// The user's law for the blocked window: the terminal must always show
     /// the question, never phone-only. While the hook blocks, Claude Code
     /// paints nothing, so the gate itself must paint — the question with its
-    /// options at publish time, and a receipt when the phone answers.
+    /// options at publish time; the receipt is the hook's `systemMessage`.
     #[test]
     fn a_blocked_question_paints_a_banner_and_a_phone_receipt_on_the_tty() {
         let _guard = crate::state::test_env_lock();
@@ -5588,9 +5705,11 @@ mod tests {
             painted.contains("[A] Postgres") && painted.contains("[B] SQLite"),
             "options with their letter codes must be on the banner: {painted}"
         );
-        assert!(painted.contains("已由手机作答：SQLite"), "{painted}");
-        // The durable receipt rides the hook reply itself — the tty banner
-        // is chewed by the post-hook repaint and never reaches scrollback.
+        // v0.2.25: no closing line on the tty — the banner is taken off the
+        // screen by a forced redraw once the wait ends (a plain file here,
+        // so the redraw is a logged no-op). The durable receipt rides the
+        // hook reply itself.
+        assert!(!painted.contains("已由手机作答"), "{painted}");
         assert_eq!(
             result["systemMessage"], "tinyCTB：已由手机作答「SQLite」",
             "{result}"
@@ -5628,7 +5747,8 @@ mod tests {
         );
         let painted = fs::read_to_string(&tty).expect("painted tty");
         assert!(painted.contains("有提问待作答"), "{painted}");
-        assert!(painted.contains("已交还本终端"), "{painted}");
+        // v0.2.25: no hand-over line — the banner is redrawn away instead.
+        assert!(!painted.contains("已交还本终端"), "{painted}");
         // The settle stamp is wall-clock time, not the gate's start instant:
         // a stamp equal to `created_at` collapses "born" and "handed back"
         // into one millisecond and forensics can no longer order them
@@ -6205,13 +6325,9 @@ mod tests {
             painted.contains("B  row"),
             "CR/LF must become spaces: {painted:?}"
         );
-        assert!(
-            painted.contains("答[2J案  完"),
-            "the receipt line must carry the sanitized answer: {painted:?}"
-        );
         // Only the banner's own fixed ANSI remains: 2 ESCs per painted line
-        // (header, question, options, footer, receipt).
-        assert_eq!(painted.matches('\u{1b}').count(), 10, "{painted:?}");
+        // (header, question, options, footer — v0.2.25 paints no receipt).
+        assert_eq!(painted.matches('\u{1b}').count(), 8, "{painted:?}");
         // The display receipt is sanitized; the tool-contract copy is
         // byte-exact — both, deliberately.
         assert_eq!(
