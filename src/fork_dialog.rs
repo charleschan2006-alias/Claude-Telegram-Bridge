@@ -299,8 +299,8 @@ enum StepResult {
 /// Hard wall-clock budget per helper step, spawn to exit: the helper's own
 /// waits (find ≤1.5s, focus ≤3s) plus python start-up and slack.
 #[cfg(not(test))]
-fn step_budget(step: &str) -> Duration {
-    match step {
+fn step_budget(args: &[&str]) -> Duration {
+    match args.first().copied().unwrap_or("") {
         "find" => Duration::from_secs(4),
         "focus" => Duration::from_secs(6),
         _ => Duration::from_secs(3),
@@ -327,7 +327,7 @@ fn run_helper_bounded(args: &[&str]) -> (StepResult, String) {
     let Ok(mut child) = cmd.spawn() else {
         return (StepResult::Refused, String::new());
     };
-    let deadline = std::time::Instant::now() + step_budget(args.first().copied().unwrap_or(""));
+    let deadline = std::time::Instant::now() + step_budget(args);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -531,6 +531,513 @@ pub(crate) fn inject_option_via_xtest(
         if entered { "sent" } else { "withheld" }
     ));
     InjectOutcome::Delivered
+}
+
+/// The key tokens of an interactive batch's ONE typing pass (v0.2.20):
+/// `←`×total resets to the first tab (the bar clamps there — measured, no
+/// wrap), then per tab either its option digit (selects it AND moves on) or
+/// `→` (skip — a tab the phone left unanswered, or the keyboard answered, is
+/// left exactly as it is), then one more `→`, which clamps on Submit. The
+/// Return that submits is NOT part of it: it is sent only after the row
+/// re-checks. `picks[seq]` = the 0-based option for tab `seq`.
+pub(crate) fn batch_key_tokens(total: usize, picks: &[TabPick]) -> Option<Vec<String>> {
+    let mut tokens = vec!["L".to_string(); total];
+    for seq in 0..total {
+        match picks.get(seq).unwrap_or(&TabPick::Skip) {
+            // A single digit per tab: a second digit would land on the NEXT tab.
+            TabPick::Single(index) if *index < 9 => tokens.push((index + 1).to_string()),
+            TabPick::Single(_) => return None,
+            // A multi-select tab: each digit toggles one box and the dialog
+            // stays on the tab, so `→` moves on afterwards. Nothing checked
+            // reads as skipped.
+            TabPick::Multi(indexes) => {
+                if indexes.iter().any(|i| *i >= 9) {
+                    return None;
+                }
+                tokens.extend(indexes.iter().map(|i| (i + 1).to_string()));
+                tokens.push("R".to_string());
+            }
+            TabPick::Skip => tokens.push("R".to_string()),
+        }
+    }
+    tokens.push("R".to_string());
+    Some(tokens)
+}
+
+/// What the phone chose for one tab of an interactive batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TabPick {
+    /// Not answered from the phone: `→` over it, leaving it as it is.
+    Skip,
+    /// A single-select tab's option.
+    Single(usize),
+    /// A multi-select tab's checked options (each toggled once from clear).
+    Multi(Vec<usize>),
+}
+
+/// Type an INTERACTIVE session's whole multi-question batch in one pass
+/// (v0.2.20) and submit it. The terminal's screen cannot be read, so tabs are
+/// not typed one by one as they are answered: the phone's answers are staged,
+/// and when every tab is staged (or「提交已答的」is tapped) this navigates and
+/// types them all — see [`batch_key_tokens`] — then presses Return on the
+/// Submit tab, whose default item submits (unanswered tabs included).
+///
+/// Same fences as [`inject_option_via_xtest`]: the session's own pts, a title
+/// mark, focus, the rows re-read, then the batch CLAIM (every row at once)
+/// before the first key; the helper re-checks focus and mark before EVERY key.
+/// A refused keys step sent nothing (claim released, `Unreachable`); an
+/// incomplete one may have typed (`Delivered`, Return withheld — the keyboard
+/// finishes, the PostToolUse hook records what was really submitted).
+pub(crate) fn inject_batch_via_xtest(
+    thread_id: &str,
+    terminal: &crate::claude::SessionTerminal,
+    total: usize,
+    picks: &[TabPick],
+    gates: &XtestGates,
+    on_pc_key: &dyn Fn(),
+) -> InjectOutcome {
+    let short = thread_id.get(..8).unwrap_or(thread_id);
+    let Some(tokens) = batch_key_tokens(total, picks) else {
+        return InjectOutcome::Unreachable;
+    };
+    let tokens = tokens.join(",");
+    if !(gates.still_open)() {
+        return InjectOutcome::Unreachable;
+    }
+    let Some(pts) = SessionPts::open(terminal) else {
+        ilog(format!(
+            "xtest-batch {short}: session process left its pts -> Unreachable"
+        ));
+        return InjectOutcome::Unreachable;
+    };
+    let Some(mark) = TitleMark::set(&pts) else {
+        ilog(format!(
+            "xtest-batch {short}: title mark not written -> Unreachable"
+        ));
+        return InjectOutcome::Unreachable;
+    };
+    let Some(window) = run_xtest_find(&mark.text) else {
+        ilog(format!(
+            "xtest-batch {short}: no single terminal window shows the mark -> Unreachable"
+        ));
+        return InjectOutcome::Unreachable;
+    };
+    let window = window.to_string();
+    if run_xtest_step(&["focus", &window, &mark.text]) != StepResult::Done {
+        ilog(format!(
+            "xtest-batch {short}: window {window} not focused -> Unreachable"
+        ));
+        return InjectOutcome::Unreachable;
+    }
+    // ONE helper process for the whole pass, its physical-key fence up from
+    // before the claim to after the Return (Astra r2): the claim happens only
+    // once the helper says `ready` (listening), and the Return only after the
+    // rows re-check while it is still listening.
+    let claimed = std::cell::Cell::new(false);
+    let on_ready = || {
+        if !(gates.still_open)() || !pts.still_session() {
+            return false;
+        }
+        let won = (gates.claim)();
+        claimed.set(won);
+        won
+    };
+    // A failed re-check — settled at the PC, OR an unreadable row — withholds
+    // the Return; the caller tells the two apart from the rows (Sol r6: a DB
+    // error must never read as "submitted at the PC").
+    let on_typed = || (gates.still_ours)() && pts.still_session();
+    let result = run_batch_pass(&window, &mark.text, &tokens, &on_ready, &on_typed);
+    let outcome = match result {
+        // Nothing typed: give the claim back (if taken) so a retry may type.
+        BatchPass::NothingTyped => {
+            if claimed.get() {
+                (gates.release)();
+            }
+            InjectOutcome::Unreachable
+        }
+        BatchPass::Entered => InjectOutcome::Delivered,
+        // A PHYSICAL key during the pass — the PC answering (电脑优先): the
+        // caller records it. Nothing typed → the claim goes back first.
+        BatchPass::PcKey { typed: false } | BatchPass::NoFence => {
+            if claimed.get() {
+                (gates.release)();
+            }
+            on_pc_key();
+            InjectOutcome::Unreachable
+        }
+        BatchPass::PcKey { typed: true } => {
+            on_pc_key();
+            InjectOutcome::SubmitPending
+        }
+        // Typed but WE withheld the Return (settled, or the session left
+        // its pts): never retyped, never claimed as submitted.
+        BatchPass::TypedNoEnter => InjectOutcome::SubmitPending,
+    };
+    ilog(format!(
+        "xtest-batch {short}: window {window} tokens {tokens}: {result:?} -> {outcome:?}"
+    ));
+    outcome
+}
+
+/// A live physical-key fence (v0.2.20, the user's 电脑优先 rule): the
+/// helper's `watch` mode, subscribed to XInput2 raw key presses. While it
+/// runs, any key pressed at the PC — the keyboard answering the dialog
+/// itself — makes [`KeyWatch::pressed`] true for good. An unanswered or
+/// failed check reads as pressed (never claim a silence we did not see).
+pub(crate) struct KeyWatch {
+    #[cfg(not(test))]
+    child: Option<std::process::Child>,
+    #[cfg(not(test))]
+    stdin: Option<std::process::ChildStdin>,
+    #[cfg(not(test))]
+    rx: std::sync::mpsc::Receiver<String>,
+    #[cfg(test)]
+    checks: std::cell::Cell<u32>,
+    seen: std::cell::Cell<bool>,
+}
+
+impl KeyWatch {
+    /// Start watching; `None` if the fence cannot be put up (no X, no
+    /// XInput2, the helper did not say `ready` in time).
+    #[cfg(not(test))]
+    pub(crate) fn start() -> Option<Self> {
+        use std::io::BufRead as _;
+        let helper = materialize_named_helper("xtest_answer.py", XTEST_HELPER_PY)?;
+        let mut cmd = Command::new(python3_bin());
+        cmd.arg(&helper)
+            .args(["watch", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        fill_x_env(&mut cmd);
+        let mut child = cmd.spawn().ok()?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            kill_and_reap(child);
+            return None;
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line.trim().to_string()).is_err() {
+                    break;
+                }
+            }
+        });
+        let watch = Self {
+            child: Some(child),
+            stdin: Some(stdin),
+            rx,
+            seen: std::cell::Cell::new(false),
+        };
+        match watch.rx.recv_timeout(Duration::from_secs(4)) {
+            Ok(line) if line == "ready" => Some(watch),
+            _ => None,
+        }
+    }
+
+    /// Has a physical key been pressed since [`KeyWatch::start`]? Sticky.
+    #[cfg(not(test))]
+    pub(crate) fn pressed(&self) -> bool {
+        use std::io::Write as _;
+        if self.seen.get() {
+            return true;
+        }
+        // `stdin` is only written from this thread; the Option dance keeps
+        // `&self` (the callers hold it in `Fn` closures).
+        let ok = self
+            .stdin
+            .as_ref()
+            .map(|mut stdin| {
+                stdin
+                    .write_all(b"check\n")
+                    .and_then(|_| stdin.flush())
+                    .is_ok()
+            })
+            .unwrap_or(false);
+        let clean = ok
+            && matches!(self.rx.recv_timeout(Duration::from_secs(1)), Ok(line) if line == "clean");
+        if !clean {
+            self.seen.set(true);
+        }
+        !clean
+    }
+
+    /// Test stub: `TINYCTB_TEST_KEYWATCH` = `none` (cannot start), `pressed`
+    /// (pressed from the first check), `late` (from the second check on);
+    /// anything else = clean.
+    #[cfg(test)]
+    pub(crate) fn start() -> Option<Self> {
+        (std::env::var("TINYCTB_TEST_KEYWATCH").as_deref() != Ok("none")).then(|| Self {
+            checks: std::cell::Cell::new(0),
+            seen: std::cell::Cell::new(false),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pressed(&self) -> bool {
+        self.checks.set(self.checks.get() + 1);
+        let pressed = match std::env::var("TINYCTB_TEST_KEYWATCH").as_deref() {
+            Ok("pressed") => true,
+            Ok("late") => self.checks.get() >= 2,
+            _ => false,
+        };
+        self.seen.set(self.seen.get() || pressed);
+        self.seen.get()
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for KeyWatch {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        if let Some(child) = self.child.take() {
+            kill_and_reap(child);
+        }
+    }
+}
+
+thread_local! {
+    /// Set when a multi-question dialog's batch Enter was written (see
+    /// [`take_enter_sent`]).
+    static ENTER_SENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the batch Enter was written since the last call (and reset). A
+/// caller brackets an injection with it: after the Enter the phone's answer
+/// is submitted, and a later PC key does not take the batch (Sol r9).
+pub(crate) fn take_enter_sent() -> bool {
+    ENTER_SENT.with(|sent| sent.replace(false))
+}
+
+/// Test seam: pretend an injection pressed the batch Enter.
+#[cfg(test)]
+pub(crate) fn note_enter_sent() {
+    ENTER_SENT.with(|sent| sent.set(true));
+}
+
+/// How long a batch helper may take from `go` to `typed`, sized by its key
+/// count: each key is ~0.3s in the helper (press, release, the 0.25s beat,
+/// the per-key checks) plus slack. 4 tabs × 8 ticks is ~41 keys (Astra r1).
+fn batch_typing_budget(keys: usize) -> Duration {
+    Duration::from_millis(2_000 + keys as u64 * 450)
+}
+
+/// How a `batch` helper pass ended (see `xtest_answer.py batch`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchPass {
+    /// No key was typed (refused before / at `go`, or stopped before the
+    /// first key).
+    NothingTyped,
+    /// Every key typed, then WE withheld the Return (exit 11).
+    TypedNoEnter,
+    /// Every key typed and the Return sent.
+    Entered,
+    /// A physical key seen (exit 13 / 14 / 15) — or the pass ended any other
+    /// way once `go` was sent (timeout, error, focus / mark lost), where the
+    /// fence's verdict is unknown: the PC's under 电脑优先. `typed` = keys
+    /// may already be in.
+    PcKey { typed: bool },
+    /// The helper could not put its physical-key fence up (exit 1 before
+    /// `ready`); nothing typed, no claim taken.
+    NoFence,
+}
+
+/// Drive one `batch` helper: wait for `ready` (its fence is listening), ask
+/// `on_ready` (re-check + claim) before `go`, wait for `typed`, ask
+/// `on_typed` (re-check) before `enter`. Every wait is bounded; a helper
+/// that misses a deadline is killed.
+#[cfg(not(test))]
+fn run_batch_pass(
+    window: &str,
+    mark: &str,
+    tokens: &str,
+    on_ready: &dyn Fn() -> bool,
+    on_typed: &dyn Fn() -> bool,
+) -> BatchPass {
+    use std::io::{BufRead as _, Write as _};
+    let Some(helper) = materialize_named_helper("xtest_answer.py", XTEST_HELPER_PY) else {
+        return BatchPass::NothingTyped;
+    };
+    let mut cmd = Command::new(python3_bin());
+    cmd.arg(&helper)
+        .args(["batch", window, mark, tokens])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    fill_x_env(&mut cmd);
+    let Ok(mut child) = cmd.spawn() else {
+        return BatchPass::NothingTyped;
+    };
+    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        kill_and_reap(child);
+        return BatchPass::NothingTyped;
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line.trim().to_string()).is_err() {
+                break;
+            }
+        }
+    });
+    // `Some(true)`: the word arrived; `Some(false)`: the helper exited (or
+    // closed stdout) first; `None`: the deadline passed.
+    let wait_for = |word: &str, budget: Duration| -> Option<bool> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            match rx.recv_timeout(left) {
+                Ok(line) if line == word => return Some(true),
+                Ok(_) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Some(false),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return None,
+            }
+        }
+    };
+    let exit_code = |child: &mut std::process::Child| -> Option<i32> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.code(),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                _ => return None,
+            }
+        }
+    };
+    match wait_for("ready", Duration::from_secs(4)) {
+        Some(true) => {}
+        Some(false) => {
+            // Exit 1 before `ready`: the physical-key fence could not be put
+            // up (no XInput2 / X) — the PC keyboard cannot be ruled out, so
+            // under 电脑优先 the PC has it (Sol r8). Other refusals (window,
+            // focus, mark) type nothing and may be retried.
+            return match exit_code(&mut child) {
+                Some(1) => BatchPass::NoFence,
+                _ => BatchPass::NothingTyped,
+            };
+        }
+        None => {
+            // Stuck before `ready` (e.g. wedged in an X round-trip): its
+            // fence never came up — the PC cannot be ruled out (Sol r9).
+            kill_and_reap(child);
+            return BatchPass::NoFence;
+        }
+    }
+    if !on_ready() {
+        let _ = stdin.write_all(b"abort\n");
+        drop(stdin);
+        if exit_code(&mut child).is_none() {
+            kill_and_reap(child);
+        }
+        return BatchPass::NothingTyped;
+    }
+    if stdin
+        .write_all(b"go\n")
+        .and_then(|_| stdin.flush())
+        .is_err()
+    {
+        kill_and_reap(child);
+        return BatchPass::NothingTyped;
+    }
+    match wait_for("typed", batch_typing_budget(tokens.split(',').count())) {
+        Some(true) => {}
+        Some(false) => {
+            // Once `go` was sent, any end that is not a clean refusal leaves
+            // the fence's verdict unknown for keys that may be in — under
+            // 电脑优先 that is the PC's (Sol r9): a timeout, an error, focus
+            // or mark lost mid-pass.
+            return match exit_code(&mut child) {
+                Some(13) => BatchPass::PcKey { typed: false },
+                Some(4) | Some(6) | Some(3) | Some(1) | Some(2) => BatchPass::NothingTyped,
+                Some(_) => BatchPass::PcKey { typed: true },
+                None => {
+                    kill_and_reap(child);
+                    let _ = run_xtest_step(&["release", "123456789"]);
+                    BatchPass::PcKey { typed: true }
+                }
+            };
+        }
+        None => {
+            kill_and_reap(child);
+            let _ = run_xtest_step(&["release", "123456789"]);
+            return BatchPass::PcKey { typed: true };
+        }
+    }
+    let word: &[u8] = if on_typed() { b"enter\n" } else { b"abort\n" };
+    if stdin.write_all(word).and_then(|_| stdin.flush()).is_err() {
+        kill_and_reap(child);
+        return BatchPass::TypedNoEnter;
+    }
+    drop(stdin);
+    match exit_code(&mut child) {
+        Some(0) => BatchPass::Entered,
+        // 11: WE withheld the Return (settled, or the session left its pts).
+        Some(11) => BatchPass::TypedNoEnter,
+        // 15 a physical key; 12 focus / mark gone; 7 an error around the
+        // Return; or no exit at all: not submitted, and the PC cannot be
+        // ruled out (Sol r9).
+        Some(_) => BatchPass::PcKey { typed: true },
+        None => {
+            kill_and_reap(child);
+            BatchPass::PcKey { typed: true }
+        }
+    }
+}
+
+/// Test stub for [`run_batch_pass`], driven by `TINYCTB_TEST_XTEST` like the
+/// other steps: `batch` refuses before `ready`; `batch-stop` stops before the
+/// first key (after the claim); `batch-partial` / `batch-timeout` cut the
+/// pass short; `enter` refuses the Return. Records `batch <window> <mark>
+/// <tokens>` once typed and `enter <window> <mark>` once the Return is sent.
+#[cfg(test)]
+fn run_batch_pass(
+    window: &str,
+    mark: &str,
+    tokens: &str,
+    on_ready: &dyn Fn() -> bool,
+    on_typed: &dyn Fn() -> bool,
+) -> BatchPass {
+    let mode = std::env::var("TINYCTB_TEST_XTEST").unwrap_or_default();
+    if mode.is_empty() || mode == "unreachable" || mode == "batch" {
+        return BatchPass::NothingTyped;
+    }
+    if mode == "batch-nofence" {
+        return BatchPass::NoFence;
+    }
+    if !on_ready() {
+        return BatchPass::NothingTyped;
+    }
+    match mode.as_str() {
+        "batch-stop" => return BatchPass::NothingTyped,
+        "batch-pc" => return BatchPass::PcKey { typed: false },
+        "batch-pc-typed" => return BatchPass::PcKey { typed: true },
+        "batch-partial" => return BatchPass::PcKey { typed: true },
+        "batch-timeout" => {
+            let _ = run_xtest_step(&["release", "123456789"]);
+            return BatchPass::PcKey { typed: true };
+        }
+        _ => {}
+    }
+    XTEST_STEPS.with(|s| {
+        s.borrow_mut()
+            .push(format!("batch {window} {mark} {tokens}"))
+    });
+    if !on_typed() {
+        return BatchPass::TypedNoEnter;
+    }
+    if mode == "enter" {
+        // The Return refused by the helper (focus / mark gone).
+        return BatchPass::PcKey { typed: true };
+    }
+    XTEST_STEPS.with(|s| s.borrow_mut().push(format!("enter {window} {mark}")));
+    BatchPass::Entered
 }
 
 /// The asking session's pts, opened ONCE and proven to be held by the same
@@ -925,6 +1432,11 @@ pub(crate) enum InjectOutcome {
     /// retry. This is what lets the inject side stop scraping the pty to GUESS the
     /// outcome — the guess (and its unrecoverable false-positive) is gone.
     Delivered,
+    /// (Multi-select tab, v0.2.20, Astra r2.) SOME of the tab's toggle digits
+    /// went in, then a write failed: the tab may hold only part of the ticked
+    /// set. Never retyped (toggles would flip back); the batch must be
+    /// checked and submitted at the PC.
+    PartlyTyped,
     /// (Multi-question, 0.2.16.) This tab's digit went into the dialog, but the
     /// batch could NOT be confirmed submitted: the tab bar was unreadable
     /// afterwards, or the walk onto Submit did not land there. The row is
@@ -1031,6 +1543,41 @@ fn count(hay: &[u8], needle: &[u8]) -> usize {
     hay.windows(needle.len()).filter(|w| *w == needle).count()
 }
 
+/// Where the LAST tab bar starts: an `←` arrow followed (past spaces and
+/// control sequences) by a tab marker `☐`/`☒`. A bare `←` in an option's
+/// label or description (「← 返回上一级」) is not the bar (Sol r16) — cutting
+/// there would drop the boxes drawn before it.
+fn last_bar_arrow(frame: &[u8]) -> Option<usize> {
+    const ARROW: &[u8] = "\u{2190}".as_bytes();
+    let mut end = frame.len();
+    while let Some(at) = rfind(&frame[..end], ARROW) {
+        let mut i = at + ARROW.len();
+        loop {
+            if frame.get(i) == Some(&b' ') {
+                i += 1;
+            } else if frame.get(i) == Some(&0x1b) && frame.get(i + 1) == Some(&b'[') {
+                let mut j = i + 2;
+                while j < frame.len() && (0x30..=0x3f).contains(&frame[j]) {
+                    j += 1;
+                }
+                if j >= frame.len() {
+                    break;
+                }
+                i = j + 1;
+            } else {
+                break;
+            }
+        }
+        if frame[i.min(frame.len())..].starts_with(TAB_UNANSWERED)
+            || frame[i.min(frame.len())..].starts_with(TAB_ANSWERED)
+        {
+            return Some(at);
+        }
+        end = at;
+    }
+    None
+}
+
 /// Read the tab bar from a captured frame (see [`TabBar`]). `None` when no
 /// tab bar is on screen — a single-question dialog, or nothing painted yet.
 pub(crate) fn tab_bar_state(frame: &[u8]) -> Option<TabBar> {
@@ -1040,7 +1587,7 @@ pub(crate) fn tab_bar_state(frame: &[u8]) -> Option<TabBar> {
     let end = rfind(frame, TAB_SUBMIT)? + TAB_SUBMIT.len();
     // Only THIS bar: it begins with the `←` arrow, so cut there — a capture
     // that holds several repaints must not have their tabs counted together.
-    let bar_start = rfind(&frame[..end], "\u{2190}".as_bytes()).unwrap_or(end.saturating_sub(600));
+    let bar_start = last_bar_arrow(&frame[..end]).unwrap_or(end.saturating_sub(600));
     let seg = &frame[bar_start..end];
     let answered = count(seg, TAB_ANSWERED);
     let unanswered = count(seg, TAB_UNANSWERED);
@@ -1086,6 +1633,102 @@ pub(crate) fn tab_bar_state(frame: &[u8]) -> Option<TabBar> {
     })
 }
 
+/// The ticked boxes of a multi-select tab on a captured frame (0-based option
+/// indexes), from the LAST bar on (option lines follow the bar). A forced
+/// repaint draws each option as `N.`, a cursor-positioning sequence, then
+/// `[✔]` (ticked) or `[` + a cursor jump + `]` (clear) — measured on Claude
+/// Code 2.1.330, 2026-11-23. Matched on the RAW bytes and only in that shape
+/// (Sol r5): the number must be followed by at least one control sequence
+/// before `[`, and an empty box must be a control sequence between the
+/// brackets, so label or description text such as a literal `2.[]` can never
+/// pass for a box. `None` when no checkbox is on screen.
+pub(crate) fn checked_boxes(frame: &[u8]) -> Option<std::collections::BTreeSet<usize>> {
+    const TICK: &[u8] = "\u{2714}".as_bytes();
+    let start = last_bar_arrow(frame).unwrap_or(0);
+    let seg = &frame[start..];
+    // Length of the CSI sequence at `at` (ESC [ params final), if any.
+    let csi = |at: usize| -> Option<usize> {
+        if seg.get(at) != Some(&0x1b) || seg.get(at + 1) != Some(&b'[') {
+            return None;
+        }
+        let mut i = at + 2;
+        while i < seg.len() && (0x30..=0x3f).contains(&seg[i]) {
+            i += 1;
+        }
+        (i < seg.len() && (0x40..=0x7e).contains(&seg[i])).then_some(i + 1 - at)
+    };
+    let mut seen = std::collections::BTreeMap::new();
+    let mut i = 0;
+    while i + 1 < seg.len() {
+        let digit = seg[i];
+        if !(b'1'..=b'9').contains(&digit) || seg[i + 1] != b'.' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 2;
+        let mut sequences = 0;
+        while let Some(len) = csi(j) {
+            j += len;
+            sequences += 1;
+        }
+        if sequences == 0 || seg.get(j) != Some(&b'[') {
+            i += 1;
+            continue;
+        }
+        j += 1;
+        let ticked = if seg[j..].starts_with(TICK) {
+            j += TICK.len();
+            Some(true)
+        } else if let Some(len) = csi(j) {
+            j += len;
+            Some(false)
+        } else {
+            None
+        };
+        match ticked {
+            Some(on) if seg.get(j) == Some(&b']') => {
+                // The LAST drawing of each line wins (a later repaint).
+                seen.insert(usize::from(digit - b'1'), on);
+                i = j + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    if seen.is_empty() {
+        return None;
+    }
+    Some(
+        seen.into_iter()
+            .filter(|(_, on)| *on)
+            .map(|(i, _)| i)
+            .collect(),
+    )
+}
+
+/// Repaint and read the tab bar and — when `boxes` — a multi-select tab's
+/// ticked boxes FROM THE SAME CAPTURE, retrying like [`read_bar`].
+fn read_tab_screen(
+    master: RawFd,
+    key_gap: Duration,
+    tries: usize,
+    boxes: bool,
+) -> (Option<TabBar>, Option<std::collections::BTreeSet<usize>>) {
+    let mut acc = Vec::new();
+    let mut last = (None, None);
+    for _ in 0..tries {
+        force_repaint(master);
+        acc.extend(drain_capture(master, key_gap * 6));
+        let bar = tab_bar_state(&acc);
+        let seen = if boxes { checked_boxes(&acc) } else { None };
+        let complete = bar.is_some() && (!boxes || seen.is_some());
+        last = (bar, seen);
+        if complete {
+            break;
+        }
+    }
+    last
+}
+
 /// Repaint and read the tab bar, retrying a few times: right after a key the
 /// dialog may still be redrawing, and an unreadable bar must never be taken
 /// for "nothing left to do".
@@ -1119,7 +1762,41 @@ fn submit_batch(
     settle_wait: Duration,
     still_authorized: &dyn Fn() -> bool,
 ) -> InjectOutcome {
+    submit_batch_with(
+        master,
+        session_id,
+        tab,
+        key_gap,
+        settle_wait,
+        still_authorized,
+        false,
+    )
+}
+
+/// [`submit_batch`], optionally PARTIAL (v0.2.20,「提交已答的」): the bar must
+/// still be exactly `total` tabs with at least one answered, and the Submit tab
+/// must be current — its default item is `1. Submit answers` even with tabs
+/// unanswered (measured 2026-11-23: "⚠ Some questions are unanswered", then
+/// `❯ 1. Submit answers` / `2. Cancel`), so Enter returns the answered ones.
+fn submit_batch_with(
+    master: RawFd,
+    session_id: &str,
+    tab: MultiTab,
+    key_gap: Duration,
+    settle_wait: Duration,
+    still_authorized: &dyn Fn() -> bool,
+    allow_partial: bool,
+) -> InjectOutcome {
     for _ in 0..tab.total {
+        // Every arrow is a key into the dialog the PC may be using: ask
+        // before each one (Sol r9), not only before the Enter.
+        if !still_authorized() {
+            ilog(format!(
+                "inject {}: revoked while walking to Submit -> SubmitPending",
+                short_id(session_id),
+            ));
+            return InjectOutcome::SubmitPending;
+        }
         if write_all(master, KEY_RIGHT).is_err() {
             break;
         }
@@ -1133,8 +1810,8 @@ fn submit_batch(
     let on_our_submit = matches!(
         read_bar(master, key_gap, 3),
         Some(b)
-            if b.answered == tab.total
-                && b.unanswered == 0
+            if b.answered + b.unanswered == tab.total
+                && (if allow_partial { b.answered >= 1 } else { b.unanswered == 0 })
                 && b.current_index == Some(tab.total)
                 && b.current.as_deref().is_some_and(|c| c.contains("Submit"))
     );
@@ -1154,6 +1831,7 @@ fn submit_batch(
     }
     match write_all(master, b"\r") {
         Ok(()) => {
+            ENTER_SENT.with(|sent| sent.set(true));
             ilog(format!(
                 "inject {}: all {} tabs answered -> submitted -> Delivered",
                 short_id(session_id),
@@ -1177,16 +1855,29 @@ fn submit_batch(
 /// whatever tab the fork or a person at the keyboard left it on), then
 /// `→`×seq. Returns the bar as repainted after the move, so the caller can
 /// verify it landed on an UNANSWERED tab before typing anything.
-fn navigate_to_tab(master: RawFd, tab: MultiTab, key_gap: Duration) -> Result<Option<TabBar>> {
+fn navigate_to_tab(
+    master: RawFd,
+    tab: MultiTab,
+    key_gap: Duration,
+    still_authorized: &dyn Fn() -> bool,
+) -> Result<Option<TabBar>> {
     // Keep every byte the arrows produce too: each arrow redraws the bar with
     // the highlight moved, and the parser reads the LAST bar, so the buffer
     // reflects where the highlight ended up even if the final repaint is slow.
+    // Every arrow asks first (Sol r9): a revoked walk stops — `None` reads as
+    // "not on our tab" and nothing more is typed.
     let mut acc = Vec::new();
     for _ in 0..tab.total {
+        if !still_authorized() {
+            return Ok(None);
+        }
         write_all(master, KEY_LEFT)?;
         acc.extend(drain_capture(master, key_gap));
     }
     for _ in 0..tab.seq {
+        if !still_authorized() {
+            return Ok(None);
+        }
         write_all(master, KEY_RIGHT)?;
         acc.extend(drain_capture(master, key_gap));
     }
@@ -1247,6 +1938,54 @@ pub(crate) fn inject_submit_only(
     })
 }
 
+/// 「提交已答的」for a background fork (v0.2.20): attach, and if the bar shows
+/// exactly `total` tabs with at least one answered, walk onto Submit and press
+/// Enter — the unanswered tabs go back to Claude empty. Nothing is typed into
+/// any tab. `Unreachable` (retryable) when the dialog is not up, the bar is
+/// not a `total`-tab bar, nothing is answered yet, or it cannot be read;
+/// `SubmitPending` when Enter was withheld at the last check.
+pub(crate) fn inject_submit_partial(
+    session_id: &str,
+    total: usize,
+    still_authorized: impl Fn() -> bool,
+) -> Result<InjectOutcome> {
+    let (connect, settle) = default_waits();
+    with_attach_pty(session_id, |master| {
+        let (intro, present) = wait_for_chrome(master, connect, true);
+        if !present {
+            ilog(format!(
+                "submit-partial {}: intro {}B no dialog -> Unreachable",
+                short_id(session_id),
+                intro.len(),
+            ));
+            return Ok(InjectOutcome::Unreachable);
+        }
+        if !still_authorized() {
+            return Ok(InjectOutcome::Unreachable);
+        }
+        let ours = matches!(
+            read_bar(master, SELECTOR_KEY_GAP, 3),
+            Some(b) if b.answered + b.unanswered == total && b.answered >= 1
+        );
+        if !ours {
+            ilog(format!(
+                "submit-partial {}: not a {total}-tab bar with an answer -> Unreachable",
+                short_id(session_id),
+            ));
+            return Ok(InjectOutcome::Unreachable);
+        }
+        Ok(submit_batch_with(
+            master,
+            session_id,
+            MultiTab { seq: 0, total },
+            SELECTOR_KEY_GAP,
+            settle,
+            &still_authorized,
+            true,
+        ))
+    })
+}
+
 /// Test convenience: the single-question form of [`inject_option_timed_multi`].
 #[cfg(test)]
 pub(crate) fn inject_option_timed(
@@ -1281,6 +2020,66 @@ pub(crate) fn inject_option_timed_multi(
     multi: Option<MultiTab>,
     still_authorized: impl Fn() -> bool,
 ) -> Result<InjectOutcome> {
+    inject_tab_digits(
+        session_id,
+        &[index],
+        false,
+        verify_present,
+        connect_wait,
+        key_gap,
+        settle_wait,
+        multi,
+        still_authorized,
+    )
+}
+
+/// A background fork's MULTI-SELECT tab (v0.2.20): navigate to tab `tab.seq`
+/// exactly as a single-select tab, then type one digit per checked option.
+/// On a multi-select tab a digit TOGGLES its checkbox and the dialog stays on
+/// the tab (measured 2026-11-23), so every digit lands on the same tab; the
+/// tab must still read unanswered (`☐` = nothing checked) before the first,
+/// so the toggles start from a clean slate. Then, as for any tab, the batch
+/// is submitted once nothing is left unanswered.
+pub(crate) fn inject_checked_tab(
+    session_id: &str,
+    indexes: &[usize],
+    tab: MultiTab,
+    still_authorized: impl Fn() -> bool,
+) -> Result<InjectOutcome> {
+    if indexes.is_empty() || indexes.iter().any(|i| *i >= 9) {
+        return Ok(InjectOutcome::Unreachable);
+    }
+    let (connect, settle) = default_waits();
+    inject_tab_digits(
+        session_id,
+        indexes,
+        true,
+        true,
+        connect,
+        SELECTOR_KEY_GAP,
+        settle,
+        Some(tab),
+        still_authorized,
+    )
+}
+
+/// `checkboxes`: a multi-select tab — every toggle is verified on screen
+/// (see [`checked_boxes`]).
+#[allow(clippy::too_many_arguments)]
+fn inject_tab_digits(
+    session_id: &str,
+    indexes: &[usize],
+    checkboxes: bool,
+    verify_present: bool,
+    connect_wait: Duration,
+    key_gap: Duration,
+    settle_wait: Duration,
+    multi: Option<MultiTab>,
+    still_authorized: impl Fn() -> bool,
+) -> Result<InjectOutcome> {
+    let Some(&index) = indexes.first() else {
+        return Ok(InjectOutcome::Unreachable);
+    };
     with_attach_pty(session_id, |master| {
         if !verify_present {
             // The manual/vouched path: let attach paint, type the number +
@@ -1372,7 +2171,7 @@ pub(crate) fn inject_option_timed_multi(
             // keyboard (`☒`), our digit would land on the next tab and answer
             // the WRONG question. Anything else: nothing typed, Unreachable
             // (retryable; the hook records what the fork actually took).
-            let bar = navigate_to_tab(master, tab, key_gap)?;
+            let bar = navigate_to_tab(master, tab, key_gap, &still_authorized)?;
             let on_our_unanswered_tab = matches!(
                 &bar,
                 Some(bar)
@@ -1405,7 +2204,11 @@ pub(crate) fn inject_option_timed_multi(
             // move tabs in that gap. Re-read the bar now and require the same
             // position + `☐`; what remains is the repaint-read → digit gap, the
             // same microsecond window the single-question path accepts.
-            let final_bar = read_bar(master, key_gap, 2);
+            // ONE repaint read, immediately before the first digit, gives
+            // both the bar and (for a multi-select tab) the boxes — no wait
+            // between this check and the key (Sol r5: a separate box read
+            // after the bar check left a whole repaint for a tab switch).
+            let (final_bar, boxes) = read_tab_screen(master, key_gap, 3, checkboxes);
             let still_on_our_tab = matches!(
                 &final_bar,
                 Some(bar)
@@ -1422,11 +2225,87 @@ pub(crate) fn inject_option_timed_multi(
                 ));
                 return Ok(InjectOutcome::Unreachable);
             }
+            // A multi-select tab starts from a VERIFIED clean slate — every box
+            // on screen unticked (Sol r4): a toggle is relative, so a box the
+            // keyboard ticked would be flipped off.
+            if checkboxes && boxes.as_ref() != Some(&std::collections::BTreeSet::new()) {
+                ilog(format!(
+                    "inject {}: tab {}/{} boxes not verifiably clear ({boxes:?}) -> Unreachable",
+                    short_id(session_id),
+                    tab.seq + 1,
+                    tab.total,
+                ));
+                return Ok(InjectOutcome::Unreachable);
+            }
             // The digit selects THIS tab's option and the dialog moves on by
             // itself — NO Enter here (Enter on a tab picks its highlighted
-            // default, measured 2026-09-12).
-            write_all(master, &option_digits(index))?;
-            drain_capture(master, key_gap);
+            // default, measured 2026-09-12). A multi-select tab takes one
+            // toggle per checked option and stays put (v0.2.20).
+            let mut expected = std::collections::BTreeSet::new();
+            // The LAST check before the first digit is the authorization
+            // (Sol r7): it follows the screen read, so a key pressed at the
+            // PC during that read is caught by the caller's fence here.
+            if !still_authorized() {
+                ilog(format!(
+                    "inject {}: revoked after the screen read -> Unreachable",
+                    short_id(session_id),
+                ));
+                return Ok(InjectOutcome::Unreachable);
+            }
+            for (n, index) in indexes.iter().enumerate() {
+                // Between toggles (Astra r3): re-authorize; the position and
+                // boxes were verified by the read right after the previous
+                // toggle. A toggle already went in, so any doubt is
+                // `PartlyTyped`: the batch goes to the PC, nothing retyped.
+                if n > 0 && !still_authorized() {
+                    ilog(format!(
+                        "inject {}: tab {}/{} revoked after {n} toggles -> PartlyTyped",
+                        short_id(session_id),
+                        tab.seq + 1,
+                        tab.total,
+                    ));
+                    return Ok(InjectOutcome::PartlyTyped);
+                }
+                if let Err(err) = write_all(master, &option_digits(*index)) {
+                    if n == 0 {
+                        return Err(err);
+                    }
+                    // Some toggles are in, not all: never retype, never call
+                    // it delivered (Astra r2).
+                    ilog(format!(
+                        "inject {}: tab {}/{} toggles cut short after {n} ({err}) -> PartlyTyped",
+                        short_id(session_id),
+                        tab.seq + 1,
+                        tab.total,
+                    ));
+                    return Ok(InjectOutcome::PartlyTyped);
+                }
+                drain_capture(master, key_gap);
+                // After EVERY toggle (the last one too): still our tab, and
+                // the boxes exactly the set typed so far (Sol r4/r5). A box
+                // the keyboard flipped, a tab switch, or an unreadable screen
+                // stops here — before any further toggle and before the batch
+                // could be submitted.
+                if checkboxes {
+                    expected.insert(*index);
+                    let (bar, seen) = read_tab_screen(master, key_gap, 3, true);
+                    let on_tab = matches!(
+                        &bar,
+                        Some(b) if b.answered + b.unanswered == tab.total
+                            && b.current_index == Some(tab.seq)
+                    );
+                    if !on_tab || seen.as_ref() != Some(&expected) {
+                        ilog(format!(
+                            "inject {}: tab {}/{} after toggle {}: bar {bar:?} boxes {seen:?} != expected {expected:?} -> PartlyTyped",
+                            short_id(session_id),
+                            tab.seq + 1,
+                            tab.total,
+                            n + 1,
+                        ));
+                        return Ok(InjectOutcome::PartlyTyped);
+                    }
+                }
+            }
             // Was that the last unanswered tab? Then submit — `submit_batch`
             // walks onto Submit and CONFIRMS it before pressing Enter. An
             // unreadable bar here defers the submit to the next tap's opening
@@ -2085,6 +2964,237 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A stub `claude attach` whose screen changes as keys arrive: it shows
+    /// `stages[0].0` until `stages[0].1` bytes were read, then `stages[1].0`,
+    /// and so on; every byte read is appended to `capture`.
+    fn staged_attach_stub(
+        dir: &std::path::Path,
+        stages: &[(String, usize)],
+        capture: &std::path::Path,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let frame = dir.join("frame.txt");
+        let mut script = format!(
+            "#!/bin/sh\nstty raw -echo 2>/dev/null\n: > '{cap}'\n( while true; do cat '{frame}' 2>/dev/null; sleep 0.03; done ) &\nprinter=$!\n",
+            cap = capture.display(),
+            frame = frame.display()
+        );
+        for (n, (screen, bytes)) in stages.iter().enumerate() {
+            let file = dir.join(format!("stage{n}.txt"));
+            std::fs::write(&file, screen).expect("stage");
+            script.push_str(&format!("cp '{}' '{}'\n", file.display(), frame.display()));
+            if *bytes > 0 {
+                script.push_str(&format!(
+                    "head -c {bytes} >> '{}' 2>/dev/null\n",
+                    capture.display()
+                ));
+            }
+        }
+        script.push_str("sleep 3\nkill \"$printer\" 2>/dev/null\n");
+        let stub = dir.join("attach-staged.sh");
+        std::fs::write(&stub, script).expect("write stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        stub
+    }
+
+    /// A multi-select tab's screen: the bar (tab 2 of 2 current) and three
+    /// option lines drawn the way a forced repaint draws them (Sol r4).
+    fn checkbox_frame(tab: &str, ticked: &[usize]) -> String {
+        let mut frame = two_tab_frame(tab);
+        for i in 0..3 {
+            let mark = if ticked.contains(&i) {
+                "\x1b[38;2;78;186;101m[\u{2714}]".to_string()
+            } else {
+                "\x1b[39m[\x1b[8G]".to_string()
+            };
+            frame.push_str(&format!(
+                "\r\x1b[2C\x1b[1B{}.\x1b[6G{mark}\x1b[10GOpt{i}",
+                i + 1
+            ));
+        }
+        frame
+    }
+
+    /// The ticked-box parser on REAL repaint bytes (Claude Code 2.1.330):
+    /// option 1 and 3 ticked, option 2 clear.
+    #[test]
+    fn checked_boxes_reads_a_real_repaint() {
+        let frame = b"\xe2\x86\x90 \xe2\x98\x92 Q1 \x1b[38;2;177;185;249m\xe2\x9d\xaf\x1b[3G\x1b[38;2;153;153;153m1.\x1b[6G\x1b[38;2;78;186;101m[\xe2\x9c\x94]\x1b[10G\x1b[38;2;177;185;249mCheese\r\x1b[9C\x1b[1B\x1b[38;2;153;153;153mCheese topping\r\x1b[2C\x1b[1B2.\x1b[6G\x1b[39m[\x1b[8G]\x1b[10GHam\r\x1b[9C\x1b[1B\x1b[38;2;153;153;153mHam topping\r\x1b[2C\x1b[1B3.\x1b[6G\x1b[38;2;78;186;101m[\xe2\x9c\x94]\x1b[10G\x1b[39mOlives\r";
+        assert_eq!(checked_boxes(frame), Some([0, 2].into_iter().collect()));
+        assert_eq!(checked_boxes(b"\xe2\x86\x90 no boxes here"), None);
+        // Description text that LOOKS like a clear box 2 cannot override the
+        // real ticked box 2 drawn before it (Sol r5).
+        let mut spoof = frame.to_vec();
+        spoof.extend_from_slice(b"\x1b[10GOlives topping 2.[] 2. [ ]\r");
+        assert_eq!(checked_boxes(&spoof), Some([0, 2].into_iter().collect()));
+        assert_eq!(
+            checked_boxes(checkbox_frame("\u{2610} Size", &[]).as_bytes()),
+            Some(Default::default())
+        );
+        // Sol r16: an `←` in an option's text is not the bar — the boxes
+        // drawn before it still count.
+        let mut arrow = frame.to_vec();
+        arrow.extend_from_slice("\x1b[10G\u{2190} 返回上一级\r".as_bytes());
+        assert_eq!(checked_boxes(&arrow), Some([0, 2].into_iter().collect()));
+        let tabs = checkbox_frame("\u{2610} Size", &[1]) + "\x1b[10G\u{2190} back";
+        assert_eq!(
+            checked_boxes(tabs.as_bytes()),
+            Some([1].into_iter().collect())
+        );
+        assert!(tab_bar_state(tabs.as_bytes()).is_some());
+    }
+
+    /// v0.2.20: a fork's MULTI-SELECT tab — from a verified clear tab, one
+    /// toggle per ticked box, each confirmed on screen before the next.
+    #[test]
+    fn a_multi_select_tab_gets_one_verified_toggle_per_ticked_box() {
+        let _guard = crate::state::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("tinyctb-multisel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let capture = dir.join("keys.bin");
+        let stub = staged_attach_stub(
+            &dir,
+            &[
+                (checkbox_frame("\u{2610} Size", &[]), 10), // ←←→ + "1"
+                (checkbox_frame("\u{2612} Size", &[0]), 1), // "3"
+                (checkbox_frame("\u{2612} Size", &[0, 2]), 0),
+            ],
+            &capture,
+        );
+        std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
+        let outcome = inject_tab_digits(
+            "sess-x",
+            &[0, 2],
+            true,
+            true,
+            Duration::from_millis(400),
+            Duration::from_millis(120),
+            Duration::from_millis(120),
+            Some(MultiTab { seq: 1, total: 2 }),
+            || true,
+        )
+        .expect("inject");
+        std::env::remove_var("TINYCTB_TEST_ATTACH");
+        assert_eq!(outcome, InjectOutcome::Delivered);
+        assert_eq!(read_keys(&capture, 11), b"\x1b[D\x1b[D\x1b[C13".to_vec());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Sol r4: the keyboard flipped a box between our toggles (the screen
+    /// shows a set we did not type) — stop before the next toggle,
+    /// `PartlyTyped`.
+    #[test]
+    fn a_multi_select_tab_stops_when_the_screen_disagrees() {
+        let _guard = crate::state::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("tinyctb-multiflip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let capture = dir.join("keys.bin");
+        let stub = staged_attach_stub(
+            &dir,
+            &[
+                (checkbox_frame("\u{2610} Size", &[]), 10),
+                // After our "1": the PC also ticked option 3.
+                (checkbox_frame("\u{2612} Size", &[0, 2]), 0),
+            ],
+            &capture,
+        );
+        std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
+        let outcome = inject_tab_digits(
+            "sess-x",
+            &[0, 2],
+            true,
+            true,
+            Duration::from_millis(400),
+            Duration::from_millis(120),
+            Duration::from_millis(120),
+            Some(MultiTab { seq: 1, total: 2 }),
+            || true,
+        )
+        .expect("inject");
+        std::env::remove_var("TINYCTB_TEST_ATTACH");
+        assert_eq!(outcome, InjectOutcome::PartlyTyped);
+        assert_eq!(
+            read_keys(&capture, 10),
+            b"\x1b[D\x1b[D\x1b[C1".to_vec(),
+            "never the second toggle"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A box already ticked at the keyboard: not a clean slate, nothing typed.
+    #[test]
+    fn a_multi_select_tab_with_a_ticked_box_gets_no_toggle() {
+        let _guard = crate::state::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("tinyctb-multipre-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let capture = dir.join("keys.bin");
+        let stub = staged_attach_stub(
+            &dir,
+            &[(checkbox_frame("\u{2610} Size", &[1]), 9)],
+            &capture,
+        );
+        std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
+        let outcome = inject_tab_digits(
+            "sess-x",
+            &[0, 2],
+            true,
+            true,
+            Duration::from_millis(400),
+            Duration::from_millis(120),
+            Duration::from_millis(120),
+            Some(MultiTab { seq: 1, total: 2 }),
+            || true,
+        )
+        .expect("inject");
+        std::env::remove_var("TINYCTB_TEST_ATTACH");
+        assert_eq!(outcome, InjectOutcome::Unreachable);
+        assert_eq!(read_keys(&capture, 9), b"\x1b[D\x1b[D\x1b[C".to_vec());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v0.2.20 (Astra r3): authorization is re-checked between toggles; if
+    /// it is lost after the first, no further digit goes out and the outcome
+    /// is `PartlyTyped` (the batch goes to the PC).
+    #[test]
+    fn a_multi_select_tab_stops_between_toggles_when_revoked() {
+        let _guard = crate::state::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("tinyctb-multirev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let capture = dir.join("keys.bin");
+        let stub = staged_attach_stub(
+            &dir,
+            &[
+                (checkbox_frame("\u{2610} Size", &[]), 10),
+                (checkbox_frame("\u{2612} Size", &[0]), 0),
+            ],
+            &capture,
+        );
+        std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
+        let calls = std::cell::Cell::new(0u32);
+        let outcome = inject_tab_digits(
+            "sess-x",
+            &[0, 2],
+            true,
+            true,
+            Duration::from_millis(400),
+            Duration::from_millis(120),
+            Duration::from_millis(120),
+            Some(MultiTab { seq: 1, total: 2 }),
+            || {
+                calls.set(calls.get() + 1);
+                // #1 dialog up, #2-#4 before each navigation arrow (←←→), #5
+                // after navigation, #6 right before the first toggle; #7,
+                // between the toggles, fails.
+                calls.get() <= 6
+            },
+        )
+        .expect("inject");
+        std::env::remove_var("TINYCTB_TEST_ATTACH");
+        assert_eq!(outcome, InjectOutcome::PartlyTyped);
+        assert_eq!(read_keys(&capture, 10), b"\x1b[D\x1b[D\x1b[C1".to_vec());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The same tab, but a person at the keyboard ALREADY answered it (the
     /// bar paints it `☒`): typing our digit would land on the NEXT tab and
     /// answer the wrong question, so only the navigation keys are sent, no
@@ -2262,9 +3372,11 @@ mod tests {
             let stub = live_attach_stub(&dir, frame, frame, &capture, keys);
             std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
             let calls = std::cell::Cell::new(0u32);
+            // Entry check and the two arrow checks pass; the re-check right
+            // before Enter (call 4) is revoked.
             let authorized_once = || {
                 calls.set(calls.get() + 1);
-                calls.get() == 1
+                calls.get() <= 3
             };
             let outcome = inject_submit_only("sess-x", 2, authorized_once).expect("submit-only");
             std::env::remove_var("TINYCTB_TEST_ATTACH");
@@ -2275,13 +3387,16 @@ mod tests {
         // Run 1 — N = 6: the walk onto Submit is exactly two right arrows.
         let (outcome, calls, bytes) = run("walk", 6);
         assert_eq!(outcome, InjectOutcome::SubmitPending);
-        assert_eq!(calls, 2, "checked once on entry, once right before Enter");
+        assert_eq!(
+            calls, 4,
+            "on entry, before each arrow, and right before Enter"
+        );
         assert_eq!(bytes, b"\x1b[C\x1b[C".to_vec(), "walked onto Submit");
         // Run 2 — N = 7: a seventh byte (Enter) would complete the capture;
         // an empty capture proves Enter was withheld after the revocation.
         let (outcome, calls, bytes) = run("noenter", 7);
         assert_eq!(outcome, InjectOutcome::SubmitPending);
-        assert_eq!(calls, 2);
+        assert_eq!(calls, 4);
         assert!(bytes.is_empty(), "a 7th byte (Enter) was sent: {bytes:?}");
     }
 
@@ -2449,6 +3564,145 @@ mod tests {
     /// v0.2.17/v0.2.19: the interactive XTEST inject is fenced by the row at
     /// every step, and finds its window ONLY through the title mark it wrote
     /// to the session's own pts — popped again on every path after the push.
+    /// v0.2.20: an interactive batch's one typing pass — reset to the first
+    /// tab, a digit per answered tab (it moves on by itself), `→` over every
+    /// tab the phone left alone, one `→` onto Submit; never a Return.
+    #[test]
+    fn batch_key_tokens_skip_unanswered_tabs_and_end_on_submit() {
+        use TabPick::{Multi, Single, Skip};
+        let tokens = |total, picks: &[TabPick]| batch_key_tokens(total, picks).map(|t| t.join(","));
+        assert_eq!(
+            tokens(3, &[Single(0), Skip, Single(1)]).as_deref(),
+            Some("L,L,L,1,R,2,R")
+        );
+        assert_eq!(tokens(2, &[Skip, Single(3)]).as_deref(), Some("L,L,R,4,R"));
+        // A short picks list reads as unanswered tabs.
+        assert_eq!(tokens(2, &[Single(0)]).as_deref(), Some("L,L,1,R,R"));
+        // A multi-select tab: one toggle per checked box, then `→`.
+        assert_eq!(
+            tokens(2, &[Multi(vec![0, 2]), Single(1)]).as_deref(),
+            Some("L,L,1,3,R,2,R")
+        );
+        // Nothing checked reads as skipped.
+        assert_eq!(
+            tokens(2, &[Multi(vec![]), Skip]).as_deref(),
+            Some("L,L,R,R,R")
+        );
+        // Two digits would spill into the next tab: refused outright.
+        assert_eq!(tokens(2, &[Single(9), Skip]), None);
+    }
+
+    /// v0.2.20: the keys step's deadline grows with its key count, so the
+    /// longest batch (4 tabs × 8 ticks ≈ 41 keys at ~0.3s) is never killed
+    /// mid-pass for being long.
+    #[test]
+    fn the_keys_budget_covers_the_longest_batch() {
+        let tokens = batch_key_tokens(4, &vec![TabPick::Multi((0..8).collect()); 4])
+            .expect("tokens")
+            .join(",");
+        assert_eq!(tokens.split(',').count(), 41);
+        let budget = batch_typing_budget(tokens.split(',').count());
+        assert!(
+            budget >= Duration::from_millis(41 * 300 + 2_000),
+            "{budget:?}"
+        );
+    }
+
+    /// v0.2.20: the batch pass is fenced like a single answer — mark, focus,
+    /// re-check, claim, ONE keys step, re-check, Return, pop — and a refused
+    /// keys step releases the claim and types nothing more.
+    #[test]
+    fn xtest_batch_pass_is_fenced_and_submits_once() {
+        let _guard = crate::state::test_env_lock();
+        let steps = || XTEST_STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        let released = std::cell::Cell::new(0u32);
+        let pc_keys = std::cell::Cell::new(0u32);
+        let terminal = crate::claude::SessionTerminal {
+            pid: 4242,
+            start: "777".to_string(),
+            tty: std::path::PathBuf::from("/dev/pts/99"),
+        };
+        let run = |claim: bool, ours: bool| {
+            inject_batch_via_xtest(
+                "sess-xtest",
+                &terminal,
+                3,
+                &[TabPick::Single(1), TabPick::Skip, TabPick::Single(0)],
+                &XtestGates {
+                    still_open: &|| true,
+                    claim: &|| claim,
+                    still_ours: &|| ours,
+                    release: &|| released.set(released.get() + 1),
+                },
+                &|| pc_keys.set(pc_keys.get() + 1),
+            )
+        };
+        const FOCUS: &str = "focus 44377815 tinyctb-mark";
+        const KEYS: &str = "batch 44377815 tinyctb-mark L,L,L,2,R,1,R";
+        const ENTER: &str = "enter 44377815 tinyctb-mark";
+        let marked = |tail: &[&str]| {
+            let mut all = vec!["push", "set", "find tinyctb-mark"];
+            all.extend_from_slice(tail);
+            all.push("pop");
+            all.into_iter().map(str::to_string).collect::<Vec<_>>()
+        };
+        std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
+        let _ = steps();
+        assert_eq!(run(true, true), InjectOutcome::Delivered);
+        assert_eq!(steps(), marked(&[FOCUS, KEYS, ENTER]));
+        // Lost the claim (asked only once the helper is listening): nothing.
+        assert_eq!(run(false, true), InjectOutcome::Unreachable);
+        assert_eq!(steps(), marked(&[FOCUS]));
+        assert_eq!(released.get(), 0, "no claim, nothing to release");
+        // The re-check failed (settled at the PC, or an unreadable row): no
+        // Return; the caller reads the rows to say which.
+        assert_eq!(run(true, false), InjectOutcome::SubmitPending);
+        assert_eq!(steps(), marked(&[FOCUS, KEYS]));
+        // The helper refused before `ready` (focus/mark/no XInput2): no claim.
+        std::env::set_var("TINYCTB_TEST_XTEST", "batch");
+        assert_eq!(run(true, true), InjectOutcome::Unreachable);
+        assert_eq!(released.get(), 0);
+        let _ = steps();
+        // Stopped before the first key (a PC key right after `go`): the
+        // claim is given back.
+        std::env::set_var("TINYCTB_TEST_XTEST", "batch-stop");
+        assert_eq!(run(true, true), InjectOutcome::Unreachable);
+        assert_eq!(released.get(), 1);
+        let _ = steps();
+        // Cut short after keys may be in (an error, focus lost, a timeout):
+        // kept claimed, not submitted, and the PC's (电脑优先, Sol r9).
+        std::env::set_var("TINYCTB_TEST_XTEST", "batch-partial");
+        assert_eq!(run(true, true), InjectOutcome::SubmitPending);
+        assert_eq!(released.get(), 1, "a possibly-typed pass is never released");
+        assert_eq!(steps(), marked(&[FOCUS]));
+        std::env::set_var("TINYCTB_TEST_XTEST", "batch-timeout");
+        assert_eq!(run(true, true), InjectOutcome::SubmitPending);
+        assert_eq!(steps(), marked(&[FOCUS, "release 123456789"]));
+        // The Return refused (focus / mark gone at that moment).
+        std::env::set_var("TINYCTB_TEST_XTEST", "enter");
+        assert_eq!(run(true, true), InjectOutcome::SubmitPending);
+        assert_eq!(steps(), marked(&[FOCUS, KEYS]));
+        assert_eq!(
+            pc_keys.get(),
+            3,
+            "partial, timeout and a refused Return are the PC's"
+        );
+        // A PHYSICAL key seen by the helper (电脑优先) is reported to the
+        // caller: before any key the claim goes back; after, it is kept.
+        std::env::set_var("TINYCTB_TEST_XTEST", "batch-pc");
+        assert_eq!(run(true, true), InjectOutcome::Unreachable);
+        assert_eq!((pc_keys.get(), released.get()), (4, 2));
+        std::env::set_var("TINYCTB_TEST_XTEST", "batch-pc-typed");
+        assert_eq!(run(true, true), InjectOutcome::SubmitPending);
+        assert_eq!((pc_keys.get(), released.get()), (5, 2));
+        // No fence could be put up: nothing typed, reported as the PC's.
+        std::env::set_var("TINYCTB_TEST_XTEST", "batch-nofence");
+        assert_eq!(run(true, true), InjectOutcome::Unreachable);
+        assert_eq!((pc_keys.get(), released.get()), (6, 2));
+        let _ = steps();
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+    }
+
     #[test]
     fn xtest_inject_is_fenced_by_the_row_at_every_step() {
         let _guard = crate::state::test_env_lock();

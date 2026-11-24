@@ -42,8 +42,36 @@ terminal, and the keys went there — 2026-10-09).
   xtest_answer.py enter  <x_window_id> <mark>
       Type Return — the one key that SUBMITS — under the same rule.
 
+  xtest_answer.py batch  <x_window_id> <mark> <tokens>
+      A multi-question batch's WHOLE pass in one process, so the physical-key
+      fence (below) is continuous from before the caller's claim to after the
+      Return. Line protocol on stdin/stdout:
+        helper: subscribes to raw key presses, validates window + mark,
+                prints `ready`
+        caller: claims the batch rows, then sends `go` (or `abort`)
+        helper: types the tokens (as `keys`), prints `typed`
+        caller: re-checks the rows, then sends `enter` (or `abort`)
+        helper: presses Return under the same per-key rule
+      ANY physical key press seen at any point after the subscription stops
+      it: before the first key nothing is typed; after it, no Return.
+      Exit: 0 Return sent; 4 / 6 / 3 / 1 refused before any key (nothing
+      typed); 10 caller aborted before `go` (nothing typed); 7 the pass may
+      be partly typed (error / focus / mark), no Return; 11 typed, caller
+      aborted the Return; 12 typed, Return refused (focus or mark gone).
+      A PHYSICAL key (the PC answering — 电脑优先) has codes of its own so
+      the caller can record it: 13 seen before the first key (nothing
+      typed); 14 seen mid-pass or after the last key (maybe typed, no
+      Return); 15 seen right before the Return (typed, no Return).
+
+  xtest_answer.py watch -
+      A physical-key fence for a caller that types by other means (a fork's
+      `claude attach` pty): subscribes to raw key presses, prints `ready`,
+      then answers each `check` line on stdin with `clean` or `pressed`
+      (sticky: once a physical key was seen, always `pressed`). Exits on EOF.
+      No XInput2: exit 1 before `ready`.
+
   xtest_answer.py release <digits>
-      Best-effort KeyRelease of those digit keys and Return, nothing else. The
+      Best-effort KeyRelease of those digit keys, Return and Left/Right, nothing else. The
       caller runs it after it had to KILL a key step at its deadline, which may
       have left a key pressed (an auto-repeating key would keep typing).
 
@@ -261,6 +289,57 @@ def _open(target, mark):
     return d, X, active, marked
 
 
+def _physical_key_watch(d):
+    """Start watching for PHYSICAL key presses; returns `pressed()`.
+
+    Selects XInput2 raw key presses on the root window for every master
+    device. Our own XTEST keys arrive too, but their SOURCE is an XTEST slave
+    device ("Virtual core XTEST keyboard"), so they are told apart. Raw event
+    payload (after the generic header): deviceid u16, time u32, detail u32,
+    sourceid u16 — read straight off the bytes (python-xlib does not parse
+    raw events). If XInput2 is unavailable, returns None: no fence, the
+    caller types as before.
+    """
+    import struct
+
+    from Xlib.ext import xinput
+
+    try:
+        if not d.has_extension("XInputExtension"):
+            return None
+        xtest_ids = set()
+        for dev in d.xinput_query_device(xinput.AllDevices).devices:
+            name = dev.name if isinstance(dev.name, bytes) else str(dev.name).encode()
+            if b"XTEST" in name:
+                xtest_ids.add(dev.deviceid)
+        d.screen().root.xinput_select_events(
+            [(xinput.AllMasterDevices, xinput.RawKeyPressMask)]
+        )
+        d.sync()
+        # NOT drained: raw events are only delivered after the selection, so
+        # anything already queued is a real key press made since — keep it.
+    except Exception:
+        return None
+
+    def pressed():
+        d.sync()
+        hit = False
+        while d.pending_events():
+            ev = d.next_event()
+            if getattr(ev, "evtype", None) != xinput.RawKeyPress:
+                continue
+            data = bytes(getattr(ev, "data", b"") or b"")
+            if len(data) < 12:
+                hit = True  # unreadable: assume a person
+                continue
+            _dev, _time, _detail, source = struct.unpack_from("=HIIH", data, 0)
+            if source not in xtest_ids:
+                hit = True
+        return hit
+
+    return pressed
+
+
 def do_keys(target, mark, keysyms):
     """Send `keysyms` to the focused window, which MUST be `target` showing `mark`.
 
@@ -325,6 +404,125 @@ def do_keys(target, mark, keysyms):
                 pass
 
 
+def do_batch(target, mark, keysyms):
+    """The `batch` step: one process, one continuous physical-key fence."""
+    from Xlib.ext import xtest
+
+    opened = _open(target, mark)
+    if isinstance(opened, int):
+        return opened
+    d, X, active, marked = opened
+    keycodes = [d.keysym_to_keycode(ks) for ks in keysyms]
+    from Xlib import XK
+
+    enter_kc = d.keysym_to_keycode(XK.XK_Return)
+    if any(kc == 0 for kc in keycodes) or enter_kc == 0:
+        return 2
+    person = _physical_key_watch(d)
+    if person is None:
+        # No XInput2: without the fence this pass is not safe to type blind.
+        return 1
+    if active() != target:
+        return 4
+    if not marked():
+        return 6
+
+    def say(word):
+        sys.stdout.write(word + "\n")
+        sys.stdout.flush()
+
+    def hear():
+        line = sys.stdin.readline()
+        return line.strip()
+
+    say("ready")
+    if hear() != "go":
+        return 10
+    started = False
+    down = None
+    try:
+        for kc in keycodes:
+            if active() != target or not marked():
+                return 7 if started else 4
+            # The physical-key check is the LAST thing before the press: the
+            # gap to a PC key is one X round-trip (an accepted residual — X11
+            # has no atomic check-and-type).
+            if person():
+                return 14 if started else 13
+            started = True
+            down = kc
+            xtest.fake_input(d, X.KeyPress, kc)
+            d.sync()
+            time.sleep(0.05)
+            xtest.fake_input(d, X.KeyRelease, kc)
+            d.sync()
+            down = None
+            time.sleep(0.25)
+        if person():
+            return 14
+        say("typed")
+        if hear() != "enter":
+            return 11
+        if active() != target or not marked():
+            return 12
+        if person():
+            return 15
+        down = enter_kc
+        xtest.fake_input(d, X.KeyPress, enter_kc)
+        d.sync()
+        time.sleep(0.05)
+        xtest.fake_input(d, X.KeyRelease, enter_kc)
+        d.sync()
+        down = None
+        return 0
+    except Exception:
+        return 7 if started else 1
+    finally:
+        if down is not None:
+            try:
+                xtest.fake_input(d, X.KeyRelease, down)
+                d.sync()
+            except Exception:
+                pass
+
+
+def do_watch():
+    from Xlib import display
+
+    d = display.Display()
+    person = _physical_key_watch(d)
+    if person is None:
+        return 1
+    sys.stdout.write("ready\n")
+    sys.stdout.flush()
+    seen = False
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            return 0
+        if line.strip() != "check":
+            continue
+        seen = seen or person()
+        sys.stdout.write("pressed\n" if seen else "clean\n")
+        sys.stdout.flush()
+
+
+def _tokens_to_keysyms(raw):
+    from Xlib import XK
+
+    keysyms = []
+    for token in raw.split(","):
+        if token == "L":
+            keysyms.append(XK.XK_Left)
+        elif token == "R":
+            keysyms.append(XK.XK_Right)
+        elif len(token) == 1 and token in "123456789":
+            keysyms.append(XK.string_to_keysym(token))
+        else:
+            return None
+    return keysyms or None
+
+
 def do_release(keysyms):
     """KeyRelease each keysym's key; releasing a key that is up is a no-op."""
     from Xlib import display, X
@@ -343,6 +541,11 @@ def main(argv):
     if len(argv) < 3:
         return 2
     mode = argv[1]
+    if mode == "watch" and len(argv) == 3:
+        try:
+            return do_watch()
+        except Exception:
+            return 1
     try:
         if mode == "find" and len(argv) == 3:
             return do_find(argv[2]) if argv[2] else 2
@@ -351,7 +554,10 @@ def main(argv):
                 return 2
             from Xlib import XK
 
-            return do_release([XK.string_to_keysym(ch) for ch in argv[2]] + [XK.XK_Return])
+            return do_release(
+                [XK.string_to_keysym(ch) for ch in argv[2]]
+                + [XK.XK_Return, XK.XK_Left, XK.XK_Right]
+            )
         if len(argv) < 4 or not argv[3]:
             return 2
         target = int(argv[2])
@@ -368,6 +574,11 @@ def main(argv):
             if not digits or not all(ch.isdigit() for ch in digits):
                 return 2
             return do_keys(target, mark, [XK.string_to_keysym(ch) for ch in digits])
+        if mode == "batch" and len(argv) == 5:
+            keysyms = _tokens_to_keysyms(argv[4])
+            if keysyms is None:
+                return 2
+            return do_batch(target, mark, keysyms)
         if mode == "enter" and len(argv) == 4:
             return do_keys(target, mark, [XK.XK_Return])
         return 2

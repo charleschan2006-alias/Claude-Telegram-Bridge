@@ -680,6 +680,98 @@ fn local_input_fresh(now_ms: u64, within_ms: u64) -> bool {
     }
 }
 
+/// How old the listener heartbeat may be (it beats every 250ms and is removed
+/// the moment the stream ends).
+#[cfg_attr(test, allow(dead_code))]
+const LISTENER_FRESH_MS: u64 = 2_000;
+
+/// Has the desktop keyboard been pressed at or after `since_ms`? `None` when
+/// that cannot be told — no live listener (stale or missing heartbeat), one
+/// that came up after `since_ms`, or an unreadable record. The daemon's listener writes
+/// `input-activity.json` at most once per second, so callers wanting "since
+/// T" pass `T - 1000` to be safe.
+pub(crate) fn local_input_since(since_ms: u64) -> Option<bool> {
+    // Tests never read the real desktop record: `TINYCTB_TEST_INPUT_SINCE`
+    // is `untouched` / `touched`; unset = unknown.
+    #[cfg(test)]
+    {
+        let _ = since_ms;
+        match std::env::var("TINYCTB_TEST_INPUT_SINCE").as_deref() {
+            Ok("untouched") => Some(false),
+            Ok("touched") => Some(true),
+            _ => None,
+        }
+    }
+    #[cfg(not(test))]
+    let dir = crate::state::state_dir_path().ok()?;
+    #[cfg(not(test))]
+    {
+        // Only a LIVE listener's silence means anything (Sol r6): its
+        // heartbeat must be fresh, and must cover the whole span since
+        // `since_ms` — a listener that came up later could have missed keys.
+        let now = crate::now_millis().ok()?;
+        let beat = std::fs::read_to_string(dir.join(crate::daemon::INPUT_LISTENER_FILE)).ok()?;
+        let beat = serde_json::from_str::<Value>(&beat).ok()?;
+        let alive = beat.get("aliveAtMs").and_then(Value::as_u64)?;
+        let up_since = beat.get("upSinceMs").and_then(Value::as_u64)?;
+        if alive > now || now - alive > LISTENER_FRESH_MS || up_since > since_ms {
+            return None;
+        }
+        let raw = std::fs::read_to_string(dir.join(crate::daemon::INPUT_ACTIVITY_FILE));
+        let last = match raw {
+            Ok(raw) => serde_json::from_str::<Value>(&raw)
+                .ok()?
+                .get("lastInputAtMs")
+                .and_then(Value::as_u64)?,
+            // A live listener that has never seen a key writes no record —
+            // but ANY other read error proves nothing (Sol r7).
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(_) => return None,
+        };
+        Some(last >= since_ms)
+    }
+}
+
+/// The PC keyboard provably untouched since `since_ms`, judged AFTER a
+/// caller's own physical-key fence went up at `fence_up_ms` (Sol r9): waits
+/// (≤3s) for a listener heartbeat taken while its reader sat idle in a read
+/// at or after `fence_up_ms` — by then every key the X server delivered
+/// before the fence has been read and published — and only then reads the
+/// record. `false` on any doubt.
+pub(crate) fn keyboard_untouched_behind_fence(since_ms: u64, fence_up_ms: u64) -> bool {
+    #[cfg(test)]
+    {
+        let _ = fence_up_ms;
+        matches!(local_input_since(since_ms), Some(false))
+    }
+    #[cfg(not(test))]
+    {
+        let Ok(dir) = crate::state::state_dir_path() else {
+            return false;
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let drained = std::fs::read_to_string(dir.join(crate::daemon::INPUT_LISTENER_FILE))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .is_some_and(|beat| {
+                    beat.get("idle").and_then(Value::as_bool) == Some(true)
+                        && beat
+                            .get("aliveAtMs")
+                            .and_then(Value::as_u64)
+                            .is_some_and(|at| at >= fence_up_ms)
+                });
+            if drained {
+                return matches!(local_input_since(since_ms), Some(false));
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 pub(crate) fn run_approval_gate<R: Read>(reader: &mut R, now: u64) -> Result<Value> {
     let payload = read_hook_payload(reader, "PermissionRequest")?;
     // AskUserQuestion is owned end to end by the question gates: PreToolUse
@@ -1441,7 +1533,19 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         tx.commit()?;
     }
 
-    let buttons = if multi_select {
+    // A multi-select question gets checkboxes + a submit button (v0.2.20);
+    // the comma reply still works alongside them.
+    let checkboxes = multi_select && !options.is_empty() && options.len() <= 8;
+    let buttons = if checkboxes {
+        checkbox_buttons(
+            &conn,
+            &telegram.chat_id,
+            &thread_id,
+            &question_id,
+            &options,
+            now,
+        )?
+    } else if multi_select {
         Vec::new()
     } else {
         question_answer_buttons(
@@ -1455,7 +1559,7 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     };
 
     let cwd = payload.get("cwd").and_then(Value::as_str);
-    let body = question_body(&question_text, &options, multi_select);
+    let body = question_body(&question_text, &options, multi_select && !checkboxes);
     let event = json!({
         "type": "question_request",
         "threadId": thread_id,
@@ -1464,6 +1568,7 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         "eventKey": format!("question:{question_id}"),
         "lastPreview": body,
         "buttons": buttons,
+        "checkboxes": checkboxes,
         // Measured here, first-hand, and carried to the phone: a background
         // session's terminal cannot show this question, so the message must
         // not let the reader assume a dialog is waiting for them at home.
@@ -1601,7 +1706,23 @@ fn release_question_batch(
     let conn = create_state_db(&state_db_path()?)?;
     let cwd = payload.get("cwd").and_then(Value::as_str);
     let banner = QuestionBanner::for_session(windowless);
-    let mut events = Vec::with_capacity(total);
+    // v0.2.20: an INTERACTIVE session's batch is phone-answerable too, under
+    // the same switch as its single questions (a verified Window session with
+    // a remembered terminal and its own pts — see `run_question_gate`). Its
+    // tabs are STAGED on tap and typed in one pass at submit time
+    // (`fork_dialog::inject_batch_via_xtest`); the keyboard keeps answering
+    // the same dialog meanwhile.
+    let xtest_target = if session_window == crate::claude::SessionWindow::Window {
+        crate::state::session_terminal_window(&conn, thread_id)
+            .ok()
+            .flatten()
+            .zip(crate::claude::session_terminal())
+    } else {
+        None
+    };
+    let phone_drives = windowless || xtest_target.is_some();
+    let mut anchor_question_id: Option<String> = None;
+    let mut events = Vec::with_capacity(total + 1);
     {
         let tx = conn.unchecked_transaction()?;
         for (seq, question) in questions.iter().enumerate() {
@@ -1629,8 +1750,13 @@ fn release_question_batch(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            // Injectable: a tab the daemon can answer by typing its number.
-            let injectable = windowless && !multi_select && !options.is_empty();
+            // Injectable: a tab the daemon can answer by typing its number
+            // (one digit — a second would land on the next tab).
+            // A multi-select tab is driven too (v0.2.20): phone checkboxes,
+            // then one toggle digit per ticked box.
+            let injectable = phone_drives
+                && !options.is_empty()
+                && options.len() <= if multi_select { 8 } else { 9 };
             let (question_id, buttons) = if injectable {
                 let question_id = format!("q{}", generate_session_uuid()?.replace('-', ""));
                 crate::state::create_pending_question(
@@ -1644,9 +1770,21 @@ fn release_question_batch(
                     now + wait.as_millis() as u64,
                 )?;
                 crate::state::set_question_batch(&tx, &question_id, &batch_id, seq, total)?;
-                crate::state::mark_question_native_attach(&tx, &question_id)?;
-                let buttons =
-                    question_answer_buttons(&tx, chat_id, thread_id, &question_id, &options, now)?;
+                match &xtest_target {
+                    Some((window, terminal)) => crate::state::mark_question_xtest_window(
+                        &tx,
+                        &question_id,
+                        *window,
+                        terminal,
+                    )?,
+                    None => crate::state::mark_question_native_attach(&tx, &question_id)?,
+                }
+                anchor_question_id.get_or_insert_with(|| question_id.clone());
+                let buttons = if multi_select {
+                    checkbox_buttons(&tx, chat_id, thread_id, &question_id, &options, now)?
+                } else {
+                    question_answer_buttons(&tx, chat_id, thread_id, &question_id, &options, now)?
+                };
                 (Some(question_id), buttons)
             } else {
                 (None, Vec::new())
@@ -1654,7 +1792,7 @@ fn release_question_batch(
             let label = format!("【第 {}/{} 问】", seq + 1, total);
             let body = if injectable {
                 format!("{label}{}", question_body(&question_text, &options, false))
-            } else if windowless {
+            } else if phone_drives {
                 let kind = if multi_select {
                     "多选题"
                 } else {
@@ -1666,7 +1804,11 @@ fn release_question_batch(
             } else {
                 format!("{label}{question_text}\n\n（多题对话框，请在终端里作答）")
             };
-            banner.paint_question(&question_text, &options, multi_select);
+            // An interactive session with a phone-driven batch shows its real
+            // dialog; a held banner over it would only be noise.
+            if xtest_target.is_none() {
+                banner.paint_question(&question_text, &options, multi_select);
+            }
             let mut event = json!({
                 "type": "question_request",
                 "threadId": thread_id,
@@ -1677,6 +1819,7 @@ fn release_question_batch(
                 },
                 "lastPreview": body,
                 "buttons": buttons,
+                "checkboxes": injectable && multi_select,
                 "terminalVisibility": terminal_visibility(session_window),
                 "thread": {
                     "threadId": thread_id,
@@ -1694,7 +1837,25 @@ fn release_question_batch(
             }
             events.push(event);
         }
-        if windowless {
+        if let Some(anchor) = &anchor_question_id {
+            // The batch-wide message under the tabs: everything answered
+            // submits by itself; this button submits what is answered so far.
+            let body = format!(
+                "【共 {total} 问】每题点一个选项即可，可以只答其中几题。\n全部答完会自动提交；只想交已答的题，点下面的按钮——没答的题留空交给 Claude。"
+            );
+            events.push(batch_submit_event(
+                &tx,
+                chat_id,
+                thread_id,
+                &batch_id,
+                anchor,
+                &body,
+                cwd,
+                &format!("question-submit:{batch_id}"),
+                now,
+            )?);
+        }
+        if phone_drives {
             // This batch is the fork's current question set; any OLDER open
             // native rows — a previous batch, or a single — are stale. Same
             // invariant as the single-question release, keyed by batch so the
@@ -1715,6 +1876,162 @@ fn release_question_batch(
         }
     }
     Ok(no_opinion())
+}
+
+/// The「提交已答的」message of a multi-question batch (v0.2.20): its body and
+/// ONE button, routed to any row of the batch (`anchor_question_id`). Used by
+/// the gate under the tabs, and by the daemon's「还没答完」reminder. It names
+/// no `questionId`: a reply to it is not an answer to any tab.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn batch_submit_event(
+    conn: &rusqlite::Connection,
+    chat_id: &str,
+    thread_id: &str,
+    batch_id: &str,
+    anchor_question_id: &str,
+    body: &str,
+    cwd: Option<&str>,
+    event_key: &str,
+    now: u64,
+) -> Result<Value> {
+    let callback_id = format!(
+        "qs{}",
+        generate_session_uuid()?
+            .replace('-', "")
+            .chars()
+            .take(16)
+            .collect::<String>()
+    );
+    insert_telegram_callback_route(
+        conn,
+        &TelegramCallbackRoute {
+            callback_id: callback_id.clone(),
+            chat_id: chat_id.to_string(),
+            message_id: None,
+            thread_id: thread_id.to_string(),
+            action: TelegramCallbackAction::SubmitQuestionBatch,
+            approval_id: None,
+            question_id: Some(anchor_question_id.to_string()),
+            answer: None,
+        },
+        now,
+    )?;
+    Ok(json!({
+        "type": "question_request",
+        "threadId": thread_id,
+        "observedAt": now,
+        "eventKey": event_key,
+        "batchSubmit": true,
+        "batchId": batch_id,
+        "batchQuestionId": anchor_question_id,
+        "lastPreview": body,
+        "buttons": [{
+            "text": "📨 提交已答的",
+            "callbackId": callback_id,
+            "action": TelegramCallbackAction::SubmitQuestionBatch.as_str()
+        }],
+        "thread": {
+            "threadId": thread_id,
+            "cwd": cwd,
+            "project": crate::projects::derive_project_label(cwd),
+            "lastPreview": body
+        }
+    }))
+}
+
+/// How long a half-answered batch may sit untouched before the phone gets a
+/// 「还没答完」reminder (v0.2.20; the user's rule: a pause of over a minute).
+pub(crate) const BATCH_REMINDER_QUIET_MS: u64 = 60_000;
+
+/// Daemon sweep: one reminder per pause for every batch the phone started
+/// answering and then left for [`BATCH_REMINDER_QUIET_MS`] with tabs still
+/// unanswered and nothing submitted. The reminder lists the missing tabs and
+/// carries its own「提交已答的」button. A new answer re-arms it. Returns how
+/// many reminders were queued.
+pub(crate) fn enqueue_batch_reminders(conn: &rusqlite::Connection, now: u64) -> Result<usize> {
+    let Ok(config) = load_daemon_config() else {
+        return Ok(0);
+    };
+    let Some(telegram) = config.telegram.as_ref() else {
+        return Ok(0);
+    };
+    // Eligibility and enqueue in ONE write transaction (Astra r2): taken
+    // IMMEDIATE, so a submit / PostToolUse settle cannot land between the
+    // check and the push — the reminder is built from the same snapshot that
+    // judged it due, or not at all.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<usize> {
+        // 电脑优先 for every waiting batch, tapped or not (Sol r9): the PC
+        // answering it at the keyboard (or no live listener to rule that
+        // out) makes it the PC's, with one notice — the phone no longer owns
+        // it, and it gets no reminder.
+        for (anchor, thread_id, asked) in crate::state::live_batches(conn, now)? {
+            if !matches!(local_input_since(asked), Some(false)) {
+                crate::telegram::declare_pc_won(conn, &anchor, &thread_id, now)?;
+            }
+        }
+        let due = crate::state::due_batch_reminders(conn, now, BATCH_REMINDER_QUIET_MS)?;
+        let mut queued = 0;
+        for reminder in due {
+            // 电脑优先 (Sol r8): if the PC keyboard was touched since the batch
+            // was asked (or that cannot be ruled out), the PC has it — say so
+            // once, and never remind about a batch the phone no longer owns.
+            if !matches!(local_input_since(reminder.created_at), Some(false)) {
+                crate::telegram::declare_pc_won(
+                    conn,
+                    &reminder.anchor_question_id,
+                    &reminder.thread_id,
+                    now,
+                )?;
+                continue;
+            }
+            let names = |seqs: &[usize]| {
+                seqs.iter()
+                    .map(|seq| format!("第 {} 问", seq + 1))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            };
+            let mut body = format!(
+                "⏰ 这组 {} 道题还没答完：已答 {} 题",
+                reminder.total, reminder.answered
+            );
+            if !reminder.missing.is_empty() {
+                body.push_str(&format!(
+                    "，还差{}（往上翻找到这些题点选项即可）",
+                    names(&reminder.missing)
+                ));
+            }
+            if !reminder.pc_only.is_empty() {
+                body.push_str(&format!("；{}只能在电脑上答", names(&reminder.pc_only)));
+            }
+            body.push_str("。\n不想再答了，点下面的按钮只提交已答的。");
+            let event = batch_submit_event(
+                conn,
+                &telegram.chat_id,
+                &reminder.thread_id,
+                &reminder.batch_id,
+                &reminder.anchor_question_id,
+                &body,
+                None,
+                &format!("question-remind:{}:{now}", reminder.batch_id),
+                now,
+            )?;
+            enqueue_outbound_event(conn, &event, now, "bridge")?;
+            crate::state::mark_batch_reminded(conn, &reminder.batch_id, &reminder.thread_id, now)?;
+            queued += 1;
+        }
+        Ok(queued)
+    })();
+    match result {
+        Ok(queued) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(queued)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 /// PostToolUse(AskUserQuestion): the authoritative "this question is answered"
@@ -1781,7 +2098,17 @@ pub(crate) fn run_question_answered_gate<R: Read>(reader: &mut R, now: u64) -> R
         })
         .unwrap_or_default();
     let conn = create_state_db(&path)?;
+    // Batches still waiting on the phone when the session's answer arrives
+    // were answered at the PC: declare them the PC's, with the notice, even
+    // if no sweep caught the keyboard in between (Sol r10). A batch the
+    // phone submitted, or is typing right now, is excluded.
+    let pc_answered = crate::state::waiting_batches_for_thread(&conn, thread_id, now)?;
     crate::state::record_native_answers_from_hook(&conn, thread_id, &answers, now)?;
+    for anchor in pc_answered {
+        if let Err(err) = crate::telegram::declare_pc_won(&conn, &anchor, thread_id, now) {
+            eprintln!("tinyctb question-answered-gate: pc-won notice: {err:#}");
+        }
+    }
     // The question is settled, so the popped `claude attach` viewer window (if a
     // person answered locally, or it was popped and the phone answered) has done
     // its job — close it so it does not linger showing the fork's ongoing output.
@@ -2418,6 +2745,85 @@ pub(crate) fn question_answer_buttons(
             "answer": label
         }));
     }
+    Ok(buttons)
+}
+
+/// A checkbox button's label (v0.2.20): `⬜ A 奶酪` / `✅ A 奶酪`. Shared by
+/// the first push and every later redraw of the keyboard.
+pub(crate) fn checkbox_text(index: usize, label: &str, checked: bool) -> String {
+    let letter = (b'A' + index as u8) as char;
+    let mark = if checked { "✅" } else { "⬜" };
+    format!("{mark} {letter} {}", truncate_tool_detail(label))
+}
+
+/// The submit button under a multi-select question's checkboxes.
+pub(crate) const CHECKBOX_SUBMIT_TEXT: &str = "📨 提交这题";
+
+/// A multi-select question's phone keyboard (v0.2.20): one checkbox per
+/// option (tap to tick / untick — the message redraws itself) and a submit
+/// button under them. The routes are never consumed by a tick.
+pub(crate) fn checkbox_buttons(
+    conn: &rusqlite::Connection,
+    chat_id: &str,
+    thread_id: &str,
+    question_id: &str,
+    options: &[String],
+    now: u64,
+) -> Result<Vec<Value>> {
+    let new_id = |prefix: &str| -> Result<String> {
+        Ok(format!(
+            "{prefix}{}",
+            generate_session_uuid()?
+                .replace('-', "")
+                .chars()
+                .take(16)
+                .collect::<String>()
+        ))
+    };
+    let mut buttons = Vec::new();
+    for (index, label) in options.iter().enumerate().take(8) {
+        let callback_id = new_id("qt")?;
+        insert_telegram_callback_route(
+            conn,
+            &TelegramCallbackRoute {
+                callback_id: callback_id.clone(),
+                chat_id: chat_id.to_string(),
+                message_id: None,
+                thread_id: thread_id.to_string(),
+                action: TelegramCallbackAction::ToggleOption,
+                approval_id: None,
+                question_id: Some(question_id.to_string()),
+                answer: Some(label.clone()),
+            },
+            now,
+        )?;
+        buttons.push(json!({
+            "text": checkbox_text(index, label, false),
+            "callbackId": callback_id,
+            "action": TelegramCallbackAction::ToggleOption.as_str(),
+            "answer": label
+        }));
+    }
+    let callback_id = new_id("qc")?;
+    insert_telegram_callback_route(
+        conn,
+        &TelegramCallbackRoute {
+            callback_id: callback_id.clone(),
+            chat_id: chat_id.to_string(),
+            message_id: None,
+            thread_id: thread_id.to_string(),
+            action: TelegramCallbackAction::SubmitChecked,
+            approval_id: None,
+            question_id: Some(question_id.to_string()),
+            answer: None,
+        },
+        now,
+    )?;
+    buttons.push(json!({
+        "text": CHECKBOX_SUBMIT_TEXT,
+        "callbackId": callback_id,
+        "action": TelegramCallbackAction::SubmitChecked.as_str()
+    }));
     Ok(buttons)
 }
 
@@ -4521,8 +4927,7 @@ mod tests {
         payload["tool_input"] = json!({ "questions": [
             { "question": "颜色？", "header": "Color",
               "options": [{"label": "RED"}, {"label": "GREEN"}] },
-            { "question": "配料？", "header": "Toppings", "multiSelect": true,
-              "options": [{"label": "A"}, {"label": "B"}] },
+            { "question": "备注？", "header": "Note", "options": [] },
             { "question": "尺寸？", "header": "Size",
               "options": [{"label": "SMALL"}, {"label": "LARGE"}] }
         ]});
@@ -4537,7 +4942,7 @@ mod tests {
 
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
         // Rows: the two single-select tabs, sharing the batch, tab indexes 0
-        // and 2 of 3 — the multi-select tab in between gets no row.
+        // and 2 of 3 — the free-text tab in between gets no row.
         type Row = (
             String,
             Option<String>,
@@ -4578,7 +4983,8 @@ mod tests {
                 Some(1)
             )
         );
-        // Pushes: one message per tab, the multi-select one included.
+        // Pushes: one message per tab, the multi-select one included, plus
+        // the batch's「提交已答的」message (v0.2.20).
         let pushes: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM outbound_events WHERE event_type = 'question_request'",
@@ -4586,18 +4992,245 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("count");
-        assert_eq!(pushes, 3);
+        assert_eq!(pushes, 4);
+        let submit: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events
+                 WHERE event_type = 'question_request' AND payload_json LIKE '%\"batchSubmit\":true%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(submit, 1, "one submit message under the tabs");
         let notify_only: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM outbound_events
-                 WHERE event_type = 'question_request' AND payload_json LIKE '%多选题%'",
+                 WHERE event_type = 'question_request' AND payload_json LIKE '%自由文本题%'",
                 [],
                 |r| r.get(0),
             )
             .expect("count");
         assert_eq!(
             notify_only, 1,
-            "the multi-select tab is pushed as a notice to answer at the PC"
+            "the free-text tab is pushed as a notice to answer at the PC"
+        );
+    }
+
+    /// v0.2.20: the daemon's sweep queues ONE「还没答完」reminder for a batch
+    /// left half-answered for a minute — naming the missing tabs and carrying
+    /// its own submit button — and none again until a new answer.
+    #[test]
+    fn a_paused_batch_gets_one_reminder_with_a_submit_button() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("batch-remind", true, 30);
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        for (id, seq) in [("m0", 0usize), ("m1", 1)] {
+            crate::state::create_pending_question(
+                &conn,
+                id,
+                "sess-r",
+                "q",
+                &["a".into(), "b".into()],
+                false,
+                0,
+                10_000_000,
+            )
+            .expect("create");
+            crate::state::set_question_batch(&conn, id, "toolu-r", seq, 2).expect("batch");
+            crate::state::mark_question_native_attach(&conn, id).expect("native");
+        }
+        crate::state::mark_question_delivered(&conn, "m0", 1_000).expect("delivered");
+        crate::state::mark_question_tapped(&conn, "m0", 1_000).expect("tapped");
+        assert_eq!(enqueue_batch_reminders(&conn, 30_000).expect("early"), 0);
+        assert_eq!(enqueue_batch_reminders(&conn, 61_000).expect("due"), 1);
+        assert_eq!(enqueue_batch_reminders(&conn, 200_000).expect("again"), 0);
+        let payload: String = conn
+            .query_row(
+                "SELECT payload_json FROM outbound_events WHERE event_type = 'question_request'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("reminder");
+        assert!(payload.contains("还差第 2 问"), "{payload}");
+        assert!(payload.contains("\"batchSubmit\":true"), "{payload}");
+        let routes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM telegram_callback_routes
+                 WHERE action = 'submit_question_batch' AND question_id = 'm0'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("routes");
+        assert_eq!(routes, 1);
+    }
+
+    /// 电脑优先 (Sol r9): a batch the phone NEVER touched is still declared
+    /// the PC's — with its notice — once the PC keyboard moves; untouched it
+    /// is left alone.
+    #[test]
+    fn an_untapped_batch_answered_at_the_pc_is_declared() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("batch-sweep-pc", true, 30);
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        for (id, seq) in [("u0", 0usize), ("u1", 1)] {
+            crate::state::create_pending_question(
+                &conn,
+                id,
+                "sess-u",
+                "q",
+                &["a".into(), "b".into()],
+                false,
+                0,
+                10_000_000,
+            )
+            .expect("create");
+            crate::state::set_question_batch(&conn, id, "toolu-u", seq, 2).expect("batch");
+            crate::state::mark_question_native_attach(&conn, id).expect("native");
+        }
+        {
+            let _quiet = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+            enqueue_batch_reminders(&conn, 5_000).expect("sweep");
+            assert!(!crate::state::batch_pc_won(&conn, "u0").expect("not won"));
+        }
+        let _typed = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "touched");
+        enqueue_batch_reminders(&conn, 6_000).expect("sweep");
+        enqueue_batch_reminders(&conn, 7_500).expect("sweep again");
+        assert!(crate::state::batch_pc_won(&conn, "u1").expect("won"));
+        let notices: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events
+                 WHERE event_type = 'bridge_notice' AND payload_json LIKE '%电脑已抢答%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("notices");
+        assert_eq!(notices, 1);
+    }
+
+    /// 电脑优先 (Sol r8): a paused batch whose PC keyboard was touched since
+    /// it was asked is NOT reminded — it is declared the PC's, once, with a
+    /// notice, and the phone no longer owns it.
+    #[test]
+    fn a_paused_batch_touched_at_the_pc_is_declared_not_reminded() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("batch-remind-pc", true, 30);
+        let _touched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "touched");
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        for (id, seq) in [("n0", 0usize), ("n1", 1)] {
+            crate::state::create_pending_question(
+                &conn,
+                id,
+                "sess-r",
+                "q",
+                &["a".into(), "b".into()],
+                false,
+                0,
+                10_000_000,
+            )
+            .expect("create");
+            crate::state::set_question_batch(&conn, id, "toolu-n", seq, 2).expect("batch");
+            crate::state::mark_question_native_attach(&conn, id).expect("native");
+        }
+        crate::state::mark_question_delivered(&conn, "n0", 1_000).expect("delivered");
+        crate::state::mark_question_tapped(&conn, "n0", 1_000).expect("tapped");
+        assert_eq!(enqueue_batch_reminders(&conn, 61_000).expect("sweep"), 0);
+        assert_eq!(enqueue_batch_reminders(&conn, 200_000).expect("again"), 0);
+        assert!(crate::state::batch_pc_won(&conn, "n1").expect("won"));
+        let (reminders, notices): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                   SUM(event_type = 'question_request'),
+                   SUM(event_type = 'bridge_notice' AND payload_json LIKE '%电脑已抢答%')
+                 FROM outbound_events",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                        r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    ))
+                },
+            )
+            .expect("counts");
+        assert_eq!((reminders, notices), (0, 1));
+    }
+
+    /// v0.2.20: an interactive (Window) session with a remembered terminal
+    /// and its own pts releases a multi-question call with every tab
+    /// phone-answerable (XTEST rows sharing the batch; the multi-select one
+    /// with checkboxes), and the「提交已答的」message under them.
+    #[test]
+    fn a_multi_question_call_on_a_window_session_is_phone_answerable() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("window-batch", true, 30);
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        crate::state::set_session_terminal_window(&conn, "sess-q", 0x2a526d7, 1000)
+            .expect("seed window");
+        drop(conn);
+        let _terminal =
+            crate::state::EnvVarGuard::set("TINYCTB_TEST_SESSION_TERMINAL", "4242:777:/dev/pts/99");
+        let mut payload = question_payload();
+        payload["tool_use_id"] = json!("toolu-batch-w");
+        payload["tool_input"] = json!({ "questions": [
+            { "question": "颜色？", "options": [{"label": "RED"}, {"label": "GREEN"}] },
+            { "question": "配料？", "multiSelect": true,
+              "options": [{"label": "A"}, {"label": "B"}] },
+            { "question": "尺寸？", "options": [{"label": "SMALL"}, {"label": "LARGE"}] }
+        ]});
+        assert_eq!(question_gate(payload), json!({}), "the real dialog renders");
+
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let rows: Vec<(i64, Option<i64>, Option<String>)> = conn
+            .prepare(
+                "SELECT batch_seq, inject_window, inject_tty FROM pending_questions
+                 WHERE thread_id = 'sess-q' ORDER BY batch_seq",
+            )
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        // v0.2.20: the multi-select tab is phone-driven too (checkboxes).
+        assert_eq!(
+            rows,
+            vec![
+                (0, Some(0x2a526d7), Some("/dev/pts/99".to_string())),
+                (1, Some(0x2a526d7), Some("/dev/pts/99".to_string())),
+                (2, Some(0x2a526d7), Some("/dev/pts/99".to_string()))
+            ]
+        );
+        let payloads: Vec<String> = conn
+            .prepare(
+                "SELECT payload_json FROM outbound_events WHERE event_type = 'question_request'",
+            )
+            .expect("prepare")
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("payloads");
+        assert_eq!(payloads.len(), 4, "{payloads:?}");
+        assert_eq!(
+            payloads
+                .iter()
+                .filter(|p| p.contains("\"batchSubmit\":true"))
+                .count(),
+            1
+        );
+        assert_eq!(payloads.iter().filter(|p| p.contains("多选题")).count(), 0);
+        assert_eq!(
+            payloads
+                .iter()
+                .filter(|p| p.contains("\"checkboxes\":true") && p.contains("submit_checked"))
+                .count(),
+            1,
+            "the multi-select tab carries checkboxes and its own submit"
+        );
+        assert_eq!(
+            payloads
+                .iter()
+                .filter(|p| p.contains("请在终端里作答"))
+                .count(),
+            0
         );
     }
 
@@ -5794,17 +6427,26 @@ mod tests {
             })
             .expect("outbound");
         let event: Value = serde_json::from_str(&payload_json).expect("json");
-        assert!(
-            event["buttons"].as_array().expect("buttons").is_empty(),
-            "a multi-select question must not offer one-tap buttons: {event}"
+        // v0.2.20: no one-tap answer buttons — checkboxes (which answer
+        // nothing on their own) and a submit button under them.
+        let actions: Vec<&str> = event["buttons"]
+            .as_array()
+            .expect("buttons")
+            .iter()
+            .map(|b| b["action"].as_str().expect("action"))
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "toggle_option",
+                "toggle_option",
+                "toggle_option",
+                "submit_checked"
+            ],
+            "{event}"
         );
-        assert!(
-            event["lastPreview"]
-                .as_str()
-                .expect("body")
-                .contains("逗号分隔"),
-            "and must say how to answer: {event}"
-        );
+        assert_eq!(event["buttons"][0]["text"], "⬜ A Postgres");
+        assert_eq!(event["checkboxes"], true, "{event}");
     }
 
     /// The answers map is keyed by the question text exactly as the tool sent

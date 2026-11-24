@@ -2680,6 +2680,65 @@ fn inject_native_attach_answer(
             false,
         ));
     };
+    if prompt.batch.is_some() && pc_priority_check(conn, question_id, now)? {
+        return Ok((PC_WON.to_string(), ApprovalAnswer::AlreadyAnswered, false));
+    }
+    // An INTERACTIVE session's batch tab (v0.2.20) is STAGED, not typed: its
+    // terminal cannot be read, so the whole batch is typed in one pass when
+    // every tab is staged or「提交已答的」is tapped.
+    if prompt.inject_window.is_some() && prompt.batch.is_some() {
+        return stage_interactive_batch_answer(conn, question_id, &prompt, answer, None, now);
+    }
+    // A batch already submitted (or handed to the PC) takes no more phone
+    // answers: its unanswered tabs still read open until PostToolUse records
+    // the result, but driving the dialog now could only misfire (Astra r2).
+    if prompt.batch.is_some() && crate::state::batch_submitted(conn, question_id)? {
+        return Ok((
+            BATCH_HANDED_OFF.to_string(),
+            ApprovalAnswer::Delivered,
+            false,
+        ));
+    }
+    // A background fork's MULTI-SELECT tab answered by a typed reply (`A,C`):
+    // tick those boxes and submit the tab, exactly as the「提交这题」button.
+    if prompt.multi_select {
+        // A closed window takes no new ticks (Sol r18): saying "closed" after
+        // rewriting the boxes would leave ✅ on screen that nobody accepted.
+        if matches!(
+            crate::state::pending_question_status(conn, question_id, now)?,
+            crate::state::QuestionStatus::Expired
+        ) {
+            return Ok((
+                "这个问题的手机答复窗口已关闭。".to_string(),
+                ApprovalAnswer::Expired,
+                false,
+            ));
+        }
+        let Some(checked) = checked_from_answer(answer, &prompt.options) else {
+            return Ok((
+                format!(
+                    "“{}”不是这个问题的选项，没能作答（未记录）。",
+                    answer.trim()
+                ),
+                ApprovalAnswer::Unknown,
+                false,
+            ));
+        };
+        if !crate::state::set_checked_options(conn, question_id, &checked)? {
+            return Ok((
+                "这题已经送进对话框了，等它提交后记录。".to_string(),
+                ApprovalAnswer::Delivered,
+                false,
+            ));
+        }
+        let (toast, retryable) = submit_checked(conn, question_id, now)?;
+        let outcome = if retryable {
+            ApprovalAnswer::Unknown
+        } else {
+            ApprovalAnswer::Delivered
+        };
+        return Ok((toast, outcome, retryable));
+    }
     // Check the row's status — including the DEADLINE — BEFORE injecting, so an
     // expired or already-answered button never drives the fork's keys.
     match crate::state::pending_question_status(conn, question_id, now)? {
@@ -2721,19 +2780,24 @@ fn inject_native_attach_answer(
             };
             // Ours as long as the row is still this fork's live question —
             // delivered or open, but not answered/expired/gone.
+            let clock = live_clock(now);
             let still_ours = || {
                 matches!(
-                    crate::state::pending_question_status(conn, question_id, now),
+                    crate::state::pending_question_status(conn, question_id, clock()),
                     Ok(crate::state::QuestionStatus::Open)
                         | Ok(crate::state::QuestionStatus::Delivered)
                 )
             };
+            let (result, pc_won) = pc_fenced(conn, question_id, &prompt.thread_id, now, |clear| {
+                crate::fork_dialog::inject_submit_only(&prompt.thread_id, batch.total, || {
+                    still_ours() && clear()
+                })
+            })?;
+            let Some(result) = result.filter(|_| !pc_won) else {
+                return Ok((PC_WON.to_string(), ApprovalAnswer::AlreadyAnswered, false));
+            };
             return Ok(
-                match crate::fork_dialog::inject_submit_only(
-                    &prompt.thread_id,
-                    batch.total,
-                    still_ours,
-                ) {
+                match result {
                     Ok(crate::fork_dialog::InjectOutcome::Delivered) => (
                         format!("已提交全部 {} 题，等 fork 确认后记录。", batch.total),
                         ApprovalAnswer::Delivered,
@@ -2742,6 +2806,7 @@ fn inject_native_attach_answer(
                     // Not submitted: still tabs to answer, no dialog, or a bar
                     // we could not trust — keep the button live to try again.
                     Ok(crate::fork_dialog::InjectOutcome::SubmitPending)
+                    | Ok(crate::fork_dialog::InjectOutcome::PartlyTyped)
                     | Ok(crate::fork_dialog::InjectOutcome::Unreachable)
                     | Err(_) => (
                         "这题的选择已在对话框里；对话框还没提交或还有题没答——全部答完后再点一次可触发提交。"
@@ -2780,10 +2845,12 @@ fn inject_native_attach_answer(
     // opened — the row is no longer `Open`, and the injector bails WITHOUT
     // driving that other question's dialog. The generic selector chrome cannot
     // tell the two apart; the row status is the question-instance identity.
+    let clock = live_clock(now);
     let still_open = || {
-        crate::state::pending_question_status(conn, question_id, now)
+        crate::state::pending_question_status(conn, question_id, clock())
             .map(|status| status == crate::state::QuestionStatus::Open)
             .unwrap_or(false)
+            && !crate::state::batch_submitted(conn, question_id).unwrap_or(true)
     };
     // An INTERACTIVE session's released question (v0.2.17) is answered by
     // XTEST-typing the option's digit into its terminal WINDOW — its pty
@@ -2803,9 +2870,10 @@ fn inject_native_attach_answer(
         };
         // After the claim the row reads `Delivered`, so "still ours" is
         // "not answered / expired / gone" rather than strictly `Open`.
+        let clock = live_clock(now);
         let still_ours = || {
             matches!(
-                crate::state::pending_question_status(conn, question_id, now),
+                crate::state::pending_question_status(conn, question_id, clock()),
                 Ok(crate::state::QuestionStatus::Open)
                     | Ok(crate::state::QuestionStatus::Delivered)
             )
@@ -2843,6 +2911,7 @@ fn inject_native_attach_answer(
                 // open / claim lost) — the row stays open for the keyboard, the
                 // hook, or another tap.
                 crate::fork_dialog::InjectOutcome::SubmitPending
+                | crate::fork_dialog::InjectOutcome::PartlyTyped
                 | crate::fork_dialog::InjectOutcome::Unreachable => (
                     "没能把答案送进电脑上的对话框，请在电脑窗口作答（未记录，可重试）。"
                         .to_string(),
@@ -2858,15 +2927,40 @@ fn inject_native_attach_answer(
         seq: b.seq,
         total: b.total,
     });
-    match crate::fork_dialog::inject_option(&prompt.thread_id, index, true, multi, still_open) {
+    let outcome = if prompt.batch.is_some() {
+        let (outcome, pc_won) = pc_fenced(conn, question_id, &prompt.thread_id, now, |clear| {
+            crate::fork_dialog::inject_option(&prompt.thread_id, index, true, multi, || {
+                still_open() && clear()
+            })
+        })?;
+        if pc_won {
+            // Whatever went in stays in (never retyped); the PC has the batch.
+            if matches!(
+                outcome,
+                Some(Ok(crate::fork_dialog::InjectOutcome::Delivered))
+                    | Some(Ok(crate::fork_dialog::InjectOutcome::SubmitPending))
+                    | Some(Ok(crate::fork_dialog::InjectOutcome::PartlyTyped))
+            ) {
+                crate::state::mark_question_delivered(conn, question_id, now)?;
+            }
+            return Ok((PC_WON.to_string(), ApprovalAnswer::AlreadyAnswered, false));
+        }
+        outcome.expect("an injection that ran")
+    } else {
+        crate::fork_dialog::inject_option(&prompt.thread_id, index, true, multi, still_open)
+    };
+    match outcome {
         Ok(crate::fork_dialog::InjectOutcome::Delivered) => {
             // The digit is in its tab: a re-tap now reads `Delivered` and types
             // nothing more. Still not an ANSWER — the PostToolUse hook records
             // that when the fork submits.
             crate::state::mark_question_delivered(conn, question_id, now)?;
+            if prompt.batch.is_some() {
+                crate::state::mark_question_tapped(conn, question_id, now)?;
+            }
             let toast = match prompt.batch {
                 Some(b) => format!(
-                    "已把「{resolved}」送进第 {}/{} 问；全部答完会自动提交并记录。",
+                    "已把「{resolved}」送进第 {}/{} 问；全部答完会自动提交，或点「提交已答的」。",
                     b.seq + 1,
                     b.total
                 ),
@@ -2874,11 +2968,15 @@ fn inject_native_attach_answer(
             };
             Ok((toast, ApprovalAnswer::Delivered, false))
         }
-        Ok(crate::fork_dialog::InjectOutcome::SubmitPending) => {
+        Ok(crate::fork_dialog::InjectOutcome::SubmitPending)
+        | Ok(crate::fork_dialog::InjectOutcome::PartlyTyped) => {
             // The digit is in (never retype), but the batch's submit could not
             // be confirmed. Keep the button LIVE: a later tap on it — status
             // `Delivered` — performs the submit-only recovery.
             crate::state::mark_question_delivered(conn, question_id, now)?;
+            if prompt.batch.is_some() {
+                crate::state::mark_question_tapped(conn, question_id, now)?;
+            }
             let toast = match prompt.batch {
                 Some(b) => format!(
                     "已把「{resolved}」送进第 {}/{} 问，但对话框还没确认提交——全部答完后再点一次这题可触发提交。",
@@ -2908,11 +3006,1019 @@ fn inject_native_attach_answer(
     }
 }
 
+/// Stage the phone's answer for one tab of an INTERACTIVE session's batch
+/// (v0.2.20). Nothing is typed yet — unless this answer completes the batch,
+/// which then types every tab in one pass and submits. Another option of the
+/// same tab may be tapped to change it until the batch is typed. Returns the
+/// toast, the audit outcome, and whether the button stays live.
+/// `ticked`: a multi-select tab's ticked indexes from its checkboxes, passed
+/// as indexes (Sol r4: rejoining them into labels and parsing them back could
+/// match a DIFFERENT option whose label contains a comma). `None` for a typed
+/// reply or a single-select tap, which is parsed from `answer`.
+fn stage_interactive_batch_answer(
+    conn: &Connection,
+    question_id: &str,
+    prompt: &crate::state::QuestionPrompt,
+    answer: &str,
+    ticked: Option<&[usize]>,
+    now: u64,
+) -> Result<(String, ApprovalAnswer, bool)> {
+    match crate::state::pending_question_status(conn, question_id, now)? {
+        crate::state::QuestionStatus::Missing => {
+            return Ok((
+                "这个按钮已经失效了。".to_string(),
+                ApprovalAnswer::Unknown,
+                false,
+            ));
+        }
+        crate::state::QuestionStatus::Answered => {
+            return Ok((
+                "这个问题已经回答过了。".to_string(),
+                ApprovalAnswer::AlreadyAnswered,
+                false,
+            ));
+        }
+        crate::state::QuestionStatus::Expired => {
+            return Ok((
+                "这个问题的手机答复窗口已关闭。用 /threads 看这个会话现在停在哪里。".to_string(),
+                ApprovalAnswer::Expired,
+                false,
+            ));
+        }
+        crate::state::QuestionStatus::Delivered => {
+            return Ok((
+                "这组题已经送进电脑上的对话框了，等它确认后记录。".to_string(),
+                ApprovalAnswer::Delivered,
+                false,
+            ));
+        }
+        crate::state::QuestionStatus::Open => {}
+    }
+    let resolved = if prompt.multi_select {
+        // A multi-select tab: the submitted ticks, or a typed reply (`A,C`).
+        let parsed = match ticked {
+            Some(ticked) => Some(ticked.to_vec()),
+            None => checked_from_answer(answer, &prompt.options),
+        };
+        let Some(checked) = parsed.filter(|c| !c.is_empty()) else {
+            return Ok((
+                format!(
+                    "“{}”不是这个问题的选项，没能作答（未记录）。",
+                    answer.trim()
+                ),
+                ApprovalAnswer::Unknown,
+                false,
+            ));
+        };
+        if !crate::state::set_checked_options(conn, question_id, &checked)? {
+            return Ok((
+                "这组题已经在提交了，等电脑确认后记录。".to_string(),
+                ApprovalAnswer::Delivered,
+                false,
+            ));
+        }
+        checked_labels(&checked, &prompt.options)
+    } else {
+        let resolved = crate::approvals::resolve_answer(answer, &prompt.options);
+        if !prompt.options.iter().any(|opt| opt == &resolved) {
+            return Ok((
+                format!("“{resolved}”不是这个问题的选项，没能作答（未记录）。"),
+                ApprovalAnswer::Unknown,
+                false,
+            ));
+        }
+        resolved
+    };
+    if !crate::state::stage_batch_answer(conn, question_id, &resolved, now)? {
+        return Ok((
+            "这组题已经在提交了，等电脑确认后记录。".to_string(),
+            ApprovalAnswer::Delivered,
+            false,
+        ));
+    }
+    let Some(batch) = crate::state::batch_rows(conn, question_id, now)? else {
+        return Ok((
+            "这个按钮已经失效了。".to_string(),
+            ApprovalAnswer::Unknown,
+            false,
+        ));
+    };
+    let staged = batch
+        .tabs
+        .iter()
+        .filter(|t| t.staged_answer.is_some())
+        .count();
+    let seq = prompt.batch.map(|b| b.seq + 1).unwrap_or(0);
+    let noted = format!("已记下第 {seq}/{} 问：{resolved}", batch.total);
+    if staged < batch.tabs.len() {
+        return Ok((
+            format!(
+                "{noted}（已答 {staged}/{} 题）。全部答完会自动提交，或点「提交已答的」。",
+                batch.tabs.len()
+            ),
+            ApprovalAnswer::Delivered,
+            false,
+        ));
+    }
+    // Every phone-answerable tab is staged — but if the dialog also has tabs
+    // only the PC can answer (free text, too many options), "all answered"
+    // is not true yet: never auto-submit past them (Sol r4). The phone may
+    // still choose to, with「提交已答的」.
+    if batch.tabs.len() < batch.total {
+        let pc_only = (0..batch.total)
+            .filter(|seq| batch.tabs.iter().all(|t| t.seq != *seq))
+            .map(|seq| format!("第 {} 问", seq + 1))
+            .collect::<Vec<_>>()
+            .join("、");
+        return Ok((
+            format!(
+                "{noted}。手机能答的题都答完了；{pc_only}只能在电脑上答。注意：手机暂存的答案还没打进电脑——在电脑上一动键盘，这组就改由电脑作答，手机的答案不会进去。想保留手机的答案，请点「提交已答的」（{pc_only}留空）；或在电脑上把整组重新答完。"
+            ),
+            ApprovalAnswer::Delivered,
+            false,
+        ));
+    }
+    let (result, _retryable) = type_interactive_batch(conn, &batch, now);
+    Ok((
+        format!("{noted}；{result}"),
+        ApprovalAnswer::Delivered,
+        false,
+    ))
+}
+
+/// The handler's `now`, advanced by the wall time spent since (Sol r17): a
+/// focus, repaint or key-by-key pass can run for seconds, and a check made
+/// right before Enter must see a deadline that passed meanwhile — not the
+/// moment the tap arrived. Keeps `now`'s unit (milliseconds in production;
+/// tests' small values are seconds, see `timestamp_to_millis`).
+fn live_clock(now: u64) -> impl Fn() -> u64 {
+    let start = std::time::Instant::now();
+    move || {
+        let spent = start.elapsed();
+        if now >= 100_000_000_000 {
+            now.saturating_add(u64::try_from(spent.as_millis()).unwrap_or(u64::MAX))
+        } else {
+            now.saturating_add(spent.as_secs())
+        }
+    }
+}
+
+/// Type an interactive batch's staged answers in one pass and submit
+/// (`fork_dialog::inject_batch_via_xtest`), fenced by the batch's rows.
+/// Returns the toast tail and whether a retry makes sense.
+fn type_interactive_batch(
+    conn: &Connection,
+    batch: &crate::state::BatchRows,
+    now: u64,
+) -> (String, bool) {
+    use crate::fork_dialog::TabPick;
+    let picks: Vec<TabPick> = (0..batch.total)
+        .map(|seq| {
+            let Some(tab) = batch.tabs.iter().find(|t| t.seq == seq) else {
+                return TabPick::Skip;
+            };
+            let Some(staged) = tab.staged_answer.as_ref() else {
+                return TabPick::Skip;
+            };
+            if tab.multi_select {
+                return TabPick::Multi(tab.checked.clone());
+            }
+            tab.options
+                .iter()
+                .position(|opt| opt == staged)
+                .map(TabPick::Single)
+                .unwrap_or(TabPick::Skip)
+        })
+        .collect();
+    let answered = picks
+        .iter()
+        .filter(|p| match p {
+            TabPick::Skip => false,
+            TabPick::Single(_) => true,
+            TabPick::Multi(v) => !v.is_empty(),
+        })
+        .count();
+    if answered == 0 {
+        return ("还没有任何题答了，先点题目的选项。".to_string(), true);
+    }
+    let Some(terminal) = batch.inject_terminal.as_ref() else {
+        return (
+            "没能把答案送进电脑上的对话框，请在电脑窗口作答（未记录）。".to_string(),
+            false,
+        );
+    };
+    // 电脑优先: this terminal's screen cannot be read, so a pass is typed only
+    // while the keyboard provably has not been touched since the batch was
+    // asked — a box ticked, a tab answered, or the cursor left in a free-text
+    // field at the PC would all turn blind keys into wrong answers (Sol
+    // r5/r7). Checked here and again right before the claim; the helper's own
+    // fence covers from then on. The record holds the latest key's exact
+    // time (throttled keys are flushed, not dropped — Sol r11), so it is
+    // compared with no margin: the Enter that sent the prompt just before
+    // the question is not a PC answer. No live listener counts as "touched".
+    let since = batch.created_at;
+    let keyboard_untouched = || matches!(crate::approvals::local_input_since(since), Some(false));
+    let first_row = batch.tabs[0].question_id.clone();
+    // 电脑优先 (widened to every batch pass, single-select too): the keyboard
+    // touched since it was asked, or that cannot be ruled out.
+    if !keyboard_untouched() {
+        if let Err(err) = declare_pc_won(conn, &first_row, &batch.thread_id, now) {
+            eprintln!("tinyctb: pc-won not recorded: {err:#}");
+        }
+        return (PC_WON.to_string(), false);
+    }
+    let pc_touched = std::cell::Cell::new(false);
+    let (batch_id, thread_id, rows) = (&batch.batch_id, &batch.thread_id, batch.tabs.len());
+    let first = batch.tabs[0].question_id.clone();
+    // Re-checked right before the claim, once the helper's own fence is up:
+    // a beat first, so a key pressed just before the fence went up has been
+    // written to the listener's record by now.
+    let clock = live_clock(now);
+    let still_open = || {
+        let open = matches!(
+            crate::state::batch_rows(conn, &first, clock()),
+            Ok(Some(b)) if b.live() && b.tabs.iter().all(|t| !t.delivered)
+        );
+        if open {
+            // The helper said `ready`: its fence is up as of now.
+            let fence_up = crate::now_millis().unwrap_or(u64::MAX);
+            if !crate::approvals::keyboard_untouched_behind_fence(since, fence_up) {
+                pc_touched.set(true);
+                return false;
+            }
+        }
+        open
+    };
+    let clock = live_clock(now);
+    let still_ours = || {
+        matches!(
+            crate::state::batch_rows(conn, &first, clock()),
+            Ok(Some(b)) if !b.expired && b.tabs.iter().all(|t| !t.answered)
+        )
+    };
+    let gates = crate::fork_dialog::XtestGates {
+        still_open: &still_open,
+        claim: &|| {
+            crate::state::claim_batch_delivery(conn, batch_id, thread_id, rows, now)
+                .unwrap_or(false)
+        },
+        still_ours: &still_ours,
+        release: &|| {
+            if let Err(err) = crate::state::release_batch_delivery(conn, batch_id, thread_id) {
+                eprintln!("tinyctb: xtest batch claim not released ({batch_id}): {err:#}");
+            }
+        },
+    };
+    let outcome = crate::fork_dialog::inject_batch_via_xtest(
+        thread_id,
+        terminal,
+        batch.total,
+        &picks,
+        &gates,
+        &|| pc_touched.set(true),
+    );
+    if pc_touched.get() {
+        if let Err(err) = declare_pc_won(conn, &first_row, &batch.thread_id, now) {
+            eprintln!("tinyctb: pc-won not recorded: {err:#}");
+        }
+        return (PC_WON.to_string(), false);
+    }
+    match outcome {
+        crate::fork_dialog::InjectOutcome::Delivered => (
+            format!(
+                "已把 {answered}/{} 题的答案送进电脑上的对话框并提交，由它确认后记录。",
+                batch.total
+            ),
+            false,
+        ),
+        // Keys went in but the pass was cut short (a PC key, a timeout) or
+        // its Return was withheld: never retyped, never claimed submitted.
+        crate::fork_dialog::InjectOutcome::SubmitPending
+        | crate::fork_dialog::InjectOutcome::PartlyTyped => {
+            // Only a CONFIRMED answer on the rows means the PC submitted; an
+            // unreadable row is not proof of anything (Sol r6).
+            let settled = matches!(
+                crate::state::batch_rows(conn, &first, now),
+                Ok(Some(b)) if b.tabs.iter().any(|t| t.answered)
+            );
+            if settled {
+                (
+                    "电脑上已经提交了这组题，以电脑上的答案为准。".to_string(),
+                    false,
+                )
+            } else {
+                (
+                    "答案没能完整打进电脑上的对话框并提交（可能是电脑键盘同时在操作）——请到电脑上检查后提交。"
+                        .to_string(),
+                    false,
+                )
+            }
+        }
+        crate::fork_dialog::InjectOutcome::Unreachable => (
+            "没能送进电脑上的对话框（已记下的答案还在，可点「提交已答的」重试，或在电脑上作答）。"
+                .to_string(),
+            true,
+        ),
+    }
+}
+
+/// The user's 电脑优先 rule (v0.2.20): once the PC keyboard has touched a
+/// batch the phone would have to TOGGLE, the PC has the answer.
+const PC_WON: &str = "电脑已抢答这组题，手机上的答复无效（以电脑上的作答为准）。";
+
+/// Declare 电脑已抢答 for `question_id`'s batch: every phone answer to it is
+/// void from now on. The first declaration also pushes a notice.
+pub(crate) fn declare_pc_won(
+    conn: &Connection,
+    question_id: &str,
+    thread_id: &str,
+    now: u64,
+) -> Result<()> {
+    // Mark and notice atomically (Sol r8): either both land or neither, so a
+    // crash between them cannot leave a won batch whose notice never goes
+    // out. A SAVEPOINT, so it nests inside a caller's transaction (the
+    // reminder sweep holds one).
+    conn.execute_batch("SAVEPOINT pc_won")?;
+    let result = (|| -> Result<()> {
+        if crate::state::mark_batch_pc_won(conn, question_id, now)? {
+            let batch_key = crate::state::batch_rows(conn, question_id, now)?
+                .map(|b| b.batch_id)
+                .unwrap_or_else(|| question_id.to_string());
+            let event = json!({
+                "type": "bridge_notice",
+                "threadId": thread_id,
+                "observedAt": now,
+                "message": "🖥️ 电脑已抢答：这组题以电脑上的作答为准，手机上的答复不再生效。",
+                "eventKey": format!("pc-won:{batch_key}")
+            });
+            crate::state::enqueue_outbound_event(conn, &event, now, "bridge")?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE pc_won")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK TO pc_won; RELEASE pc_won");
+            Err(error)
+        }
+    }
+}
+
+/// 电脑优先 for every phone action on a multi-question batch (the user's
+/// rule, widened 2026-11-23 to single-select too): if the batch was already
+/// won by the PC, or the PC keyboard has been touched since it was asked (or
+/// that cannot be proven otherwise — no live listener), the PC has it and
+/// this returns true (declaring it). False for a row outside any batch.
+fn pc_priority_check(conn: &Connection, question_id: &str, now: u64) -> Result<bool> {
+    let Some(batch) = crate::state::batch_rows(conn, question_id, now)? else {
+        return Ok(false);
+    };
+    if crate::state::batch_pc_won(conn, question_id)? {
+        return Ok(true);
+    }
+    // A batch already settled (the session recorded its answer) or already
+    // submitted from the phone is not "won" after the fact (Sol r8): the
+    // handlers below say what happened to it.
+    // An EXPIRED batch is not won either (Sol r12): the PC typing later in
+    // the day is ordinary use, and the tap must hear that the window closed.
+    if batch.submitted || batch.expired || batch.tabs.iter().any(|t| t.answered) {
+        return Ok(false);
+    }
+    let untouched = matches!(
+        crate::approvals::local_input_since(batch.created_at),
+        Some(false)
+    );
+    if !untouched {
+        declare_pc_won(conn, question_id, &batch.thread_id, now)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Run a fork batch injection under a live physical-key fence (电脑优先):
+/// the fence goes up, then — after a beat for earlier keys to be published —
+/// the keyboard history is checked; `inject` gets a `clear()` check to AND
+/// into its authorization, so a PC key at any point stops the next write.
+/// Returns `(outcome, pc_won)`: `(None, true)` = won before anything ran;
+/// `(Some(_), true)` = won during the injection (declared either way).
+fn pc_fenced<T>(
+    conn: &Connection,
+    question_id: &str,
+    thread_id: &str,
+    now: u64,
+    inject: impl FnOnce(&dyn Fn() -> bool) -> T,
+) -> Result<(Option<T>, bool)> {
+    let Some(watch) = crate::fork_dialog::KeyWatch::start() else {
+        declare_pc_won(conn, question_id, thread_id, now)?;
+        return Ok((None, true));
+    };
+    let fence_up = crate::now_millis().unwrap_or(u64::MAX);
+    let asked = crate::state::batch_rows(conn, question_id, now)?
+        .map(|b| b.created_at)
+        .unwrap_or(0);
+    if pc_priority_check(conn, question_id, now)?
+        || !crate::approvals::keyboard_untouched_behind_fence(asked, fence_up)
+        || watch.pressed()
+    {
+        declare_pc_won(conn, question_id, thread_id, now)?;
+        return Ok((None, true));
+    }
+    let clear = || !watch.pressed();
+    let _ = crate::fork_dialog::take_enter_sent();
+    // While the phone types, the batch is marked as being typed from the
+    // phone, so a PostToolUse or sweep in that window does not read it as
+    // answered at the PC; if the injection pressed the batch's Enter (an
+    // auto-submit included), the batch is the phone's submitted one from
+    // then on (Sol r10).
+    crate::state::set_batch_phone_typing(conn, question_id, now)?;
+    let outcome = inject(&clear);
+    let entered = crate::fork_dialog::take_enter_sent();
+    if entered {
+        if let Some(b) = crate::state::batch_rows(conn, question_id, now)? {
+            crate::state::mark_batch_submitted(conn, &b.batch_id, &b.thread_id, now)?;
+        }
+    }
+    crate::state::clear_batch_phone_typing(conn, question_id, now)?;
+    // An ACTIVE last look (Sol r8): a key queued during the last repaint
+    // would not have been asked about by any authorization yet — unless the
+    // injection already pressed the batch's Enter: the phone's answer was
+    // submitted, and a key after that does not undo it (Sol r9).
+    if !entered && watch.pressed() {
+        declare_pc_won(conn, question_id, thread_id, now)?;
+        return Ok((Some(outcome), true));
+    }
+    Ok((Some(outcome), false))
+}
+
+/// A batch whose Submit was pressed — or that was handed to the PC after a
+/// pass that could not be vouched for — takes no more phone answers.
+const BATCH_HANDED_OFF: &str = "这组题已经提交（或已交给电脑处理），等对话框确认后记录。";
+
+/// 「提交已答的」(v0.2.20): submit a multi-question batch with the tabs
+/// answered so far; the rest go back to Claude unanswered. An interactive
+/// session's staged answers are typed in one pass and submitted; a background
+/// fork's typed tabs are submitted through `claude attach`. Returns the toast
+/// and whether the button stays live (a transient miss).
+fn submit_question_batch(conn: &Connection, question_id: &str, now: u64) -> Result<(String, bool)> {
+    let Some(batch) = crate::state::batch_rows(conn, question_id, now)? else {
+        return Ok(("这个按钮已经失效了。".to_string(), false));
+    };
+    if batch.tabs.iter().any(|t| t.answered) {
+        return Ok(("这组题已经提交过了。".to_string(), false));
+    }
+    if batch.expired {
+        return Ok((
+            "这组题的手机答复窗口已关闭。用 /threads 看这个会话现在停在哪里。".to_string(),
+            false,
+        ));
+    }
+    if batch.submitted {
+        return Ok((BATCH_HANDED_OFF.to_string(), false));
+    }
+    if batch.inject_window.is_some() {
+        return Ok(type_interactive_batch(conn, &batch, now));
+    }
+    if !batch.tabs.iter().any(|t| t.delivered) {
+        return Ok(("还没有任何题答了，先点题目的选项。".to_string(), true));
+    }
+    let first = batch.tabs[0].question_id.clone();
+    let clock = live_clock(now);
+    let still_ours = || {
+        matches!(
+            crate::state::batch_rows(conn, &first, clock()),
+            Ok(Some(b)) if b.live()
+        )
+    };
+    let (result, pc_won) = pc_fenced(conn, question_id, &batch.thread_id, now, |clear| {
+        crate::fork_dialog::inject_submit_partial(&batch.thread_id, batch.total, || {
+            still_ours() && clear()
+        })
+    })?;
+    let Some(result) = result.filter(|_| !pc_won) else {
+        return Ok((PC_WON.to_string(), false));
+    };
+    Ok(match result {
+        Ok(crate::fork_dialog::InjectOutcome::Delivered) => {
+            crate::state::mark_batch_submitted(conn, &batch.batch_id, &batch.thread_id, now)?;
+            (
+                "已提交已答的题（没答的留空），等 fork 确认后记录。".to_string(),
+                false,
+            )
+        }
+        Ok(_) | Err(_) => (
+            "没能提交：对话框没连上，或它上面还没有已答的题（可重试）。".to_string(),
+            true,
+        ),
+    })
+}
+
+/// A multi-select answer as ticked option indexes: one exact label, or a
+/// comma list of labels / letters (`A,C`). `None` if any part is not an
+/// option (or nothing is named).
+fn checked_from_answer(answer: &str, options: &[String]) -> Option<Vec<usize>> {
+    let trimmed = answer.trim();
+    // A single letter is the BUTTON letter first (Sol r14): the checkboxes
+    // read `⬜ A <label>` and the hint says to reply with letters, so `A`
+    // must mean the first box even when another option's label is `A`.
+    let letter = |part: &str| -> Option<usize> {
+        let mut chars = part.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) if c.is_ascii_alphabetic() => {
+                let index = usize::from(c.to_ascii_uppercase() as u8 - b'A');
+                (index < options.len()).then_some(index)
+            }
+            _ => None,
+        }
+    };
+    let parts: Vec<&str> = trimmed
+        .split([',', '，', '、'])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    // A reply made ONLY of button letters (`A`, `a, c`) is letters, before
+    // any label match (Sol r15: with labels `A`, `B`, `A, B`, the reply
+    // `A, B` means the first two boxes, not the third).
+    if !parts.is_empty() {
+        if let Some(mut checked) = parts.iter().map(|p| letter(p)).collect::<Option<Vec<_>>>() {
+            checked.sort_unstable();
+            checked.dedup();
+            return Some(checked);
+        }
+    }
+    if let Some(index) = options.iter().position(|opt| opt == trimmed) {
+        return Some(vec![index]);
+    }
+    // Token by token: each is a letter (`a` / `C`) or a label, mixed freely.
+    let mut checked = Vec::new();
+    for part in parts {
+        let index = match letter(part) {
+            Some(index) => index,
+            None => options.iter().position(|opt| opt == part)?,
+        };
+        checked.push(index);
+    }
+    checked.sort_unstable();
+    checked.dedup();
+    (!checked.is_empty()).then_some(checked)
+}
+
+/// The ticked options as the native dialog reports them: `Cheese, Olives`.
+fn checked_labels(checked: &[usize], options: &[String]) -> String {
+    checked
+        .iter()
+        .filter_map(|i| options.get(*i).cloned())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Tick / untick one checkbox (v0.2.20). Answers nothing — the「提交这题」
+/// button does — and returns the redrawn keyboard for the dispatcher to put
+/// on the tapped message. The route is never consumed.
+fn toggle_checkbox(conn: &Connection, route: &RoutedTelegramCallback, now: u64) -> Result<Value> {
+    let reply = |toast: &str, keep: bool, keyboard: Option<Value>| {
+        json!({
+            "ok": true,
+            "action": "telegram_question_toggle",
+            "questionId": route.question_id,
+            "threadId": route.thread_id,
+            "keepRoute": keep,
+            "keyboard": keyboard,
+            "toast": toast
+        })
+    };
+    let (Some(question_id), Some(label)) = (route.question_id.as_deref(), route.answer.as_deref())
+    else {
+        return Ok(reply("这个按钮已经失效了。", false, None));
+    };
+    let Some(prompt) = crate::state::question_prompt(conn, question_id)? else {
+        return Ok(reply("这个按钮已经失效了。", false, None));
+    };
+    match crate::state::pending_question_status(conn, question_id, now)? {
+        crate::state::QuestionStatus::Open => {}
+        crate::state::QuestionStatus::Delivered => {
+            return Ok(reply("这题已经提交了，不能再改。", true, None));
+        }
+        crate::state::QuestionStatus::Answered => {
+            return Ok(reply("这个问题已经回答过了。", false, None));
+        }
+        crate::state::QuestionStatus::Expired => {
+            return Ok(reply("这个问题的手机答复窗口已关闭。", false, None));
+        }
+        crate::state::QuestionStatus::Missing => {
+            return Ok(reply("这个按钮已经失效了。", false, None));
+        }
+    }
+    // The box's index is the tapped button's POSITION among its message's
+    // checkboxes (Sol r16): two options may share a label (with different
+    // descriptions), and a label lookup would always toggle the first.
+    let routes = crate::state::sibling_question_routes(conn, &route.callback_id)?;
+    let by_position = routes
+        .iter()
+        .filter(|(_, action, _)| action == "toggle_option")
+        .position(|(id, _, _)| *id == route.callback_id)
+        .filter(|i| prompt.options.get(*i).map(String::as_str) == Some(label));
+    let Some(index) = by_position.or_else(|| prompt.options.iter().position(|opt| opt == label))
+    else {
+        return Ok(reply("这个按钮已经失效了。", false, None));
+    };
+    let was_staged = crate::state::batch_rows(conn, question_id, now)?
+        .and_then(|b| b.tabs.into_iter().find(|t| t.question_id == question_id))
+        .is_some_and(|t| t.staged_answer.is_some());
+    let mut checked = crate::state::checked_options(conn, question_id)?;
+    let ticked = if let Some(at) = checked.iter().position(|i| *i == index) {
+        checked.remove(at);
+        false
+    } else {
+        checked.push(index);
+        true
+    };
+    if !crate::state::set_checked_options(conn, question_id, &checked)? {
+        return Ok(reply("这题已经提交了，不能再改。", true, None));
+    }
+    checked.sort_unstable();
+    let keyboard = checkbox_keyboard(conn, &route.callback_id, &prompt.options, &checked)?;
+    // The toast carries the WHOLE ticked set: if the keyboard redraw fails
+    // the screen is stale, and the toast is still the truth.
+    let now_ticked = if checked.is_empty() {
+        "无".to_string()
+    } else {
+        checked
+            .iter()
+            .filter_map(|i| prompt.options.get(*i).map(String::as_str))
+            .collect::<Vec<_>>()
+            .join("、")
+    };
+    let mut toast = format!(
+        "{}：{label}。现在勾选的是：{now_ticked}",
+        if ticked { "已勾选" } else { "已取消" },
+    );
+    if was_staged {
+        toast.push_str("——这题需要重新点「提交这题」");
+    }
+    Ok(reply(&toast, true, keyboard))
+}
+
+/// Redraw a checkbox message's keyboard — best-effort, retried once; the
+/// toast (or reply) already named the whole ticked set if this fails.
+fn edit_checkbox_markup(
+    telegram: &TelegramConfig,
+    message_id: i64,
+    keyboard: Value,
+    timeout: Duration,
+) {
+    let edit = json!({
+        "chat_id": telegram.chat_id,
+        "message_id": message_id,
+        "reply_markup": keyboard
+    });
+    let mut result = Ok(Value::Null);
+    for attempt in 0..2 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        result = self::api::telegram_api_post(
+            &telegram.bot_token,
+            "editMessageReplyMarkup",
+            &edit,
+            timeout,
+        );
+        if result.is_ok() {
+            break;
+        }
+    }
+    if let Err(error) = result {
+        eprintln!("tinyctb: checkbox redraw failed: {error:#}");
+    }
+}
+
+/// A typed reply (`A,C`) changed a multi-select question's ticks (Sol r12):
+/// redraw its checkbox message to match, or the stale ⬜/✅ on screen would
+/// make the next tap toggle the opposite way of what the user sees.
+fn redraw_question_checkboxes(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    question_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let Some(prompt) = crate::state::question_prompt(conn, question_id)? else {
+        return Ok(());
+    };
+    if !prompt.multi_select {
+        return Ok(());
+    }
+    let Some((callback_id, message_id)) = crate::state::question_checkbox_route(conn, question_id)?
+    else {
+        return Ok(());
+    };
+    let checked = crate::state::checked_options(conn, question_id)?;
+    if let Some(keyboard) = checkbox_keyboard(conn, &callback_id, &prompt.options, &checked)? {
+        edit_checkbox_markup(telegram, message_id, keyboard, timeout);
+    }
+    Ok(())
+}
+
+/// The tapped message's checkbox keyboard redrawn for `checked`, from the
+/// routes it was sent with (`None` if they cannot be found).
+fn checkbox_keyboard(
+    conn: &Connection,
+    callback_id: &str,
+    options: &[String],
+    checked: &[usize],
+) -> Result<Option<Value>> {
+    let routes = crate::state::sibling_question_routes(conn, callback_id)?;
+    // Box N is the N-th checkbox route (Sol r16: labels may repeat).
+    let toggles: Vec<_> = routes
+        .iter()
+        .filter(|(_, action, _)| action == "toggle_option")
+        .collect();
+    let mut rows = Vec::new();
+    for (index, label) in options.iter().enumerate() {
+        if let Some((id, _, _)) = toggles
+            .get(index)
+            .filter(|(_, _, answer)| answer.as_deref() == Some(label))
+        {
+            rows.push(json!([{
+                "text": crate::approvals::checkbox_text(index, label, checked.contains(&index)),
+                "callback_data": format!("claude:{id}")
+            }]));
+        }
+    }
+    if let Some((id, _, _)) = routes
+        .iter()
+        .find(|(_, action, _)| action == "submit_checked")
+    {
+        rows.push(json!([{
+            "text": crate::approvals::CHECKBOX_SUBMIT_TEXT,
+            "callback_data": format!("claude:{id}")
+        }]));
+    }
+    Ok((!rows.is_empty()).then(|| json!({ "inline_keyboard": rows })))
+}
+
+/// 「提交这题」(v0.2.20): answer a multi-select question with its ticked
+/// boxes. A held question records the answer for its blocked hook; an
+/// interactive batch tab is staged (and the batch typed once complete); a
+/// background fork's tab is typed into its dialog. Returns the toast and
+/// whether the button stays live.
+fn submit_checked(conn: &Connection, question_id: &str, now: u64) -> Result<(String, bool)> {
+    // Started at once (Sol r18): the fence's idle-heartbeat wait and the
+    // claim come before the injection, and the pre-Enter deadline check must
+    // count them too.
+    let clock = live_clock(now);
+    let Some(prompt) = crate::state::question_prompt(conn, question_id)? else {
+        return Ok(("这个按钮已经失效了。".to_string(), false));
+    };
+    // A batch already submitted or handed to the PC is refused FIRST,
+    // whatever this tab's own ticks or state (Astra r3).
+    if prompt.batch.is_some() && crate::state::batch_submitted(conn, question_id)? {
+        return Ok((BATCH_HANDED_OFF.to_string(), false));
+    }
+    // A closed or settled question says so BEFORE the empty-ticks hint (Sol
+    // r15): telling the user to go tick boxes on an expired question only
+    // sends them to buttons that answer "window closed".
+    match crate::state::pending_question_status(conn, question_id, now)? {
+        crate::state::QuestionStatus::Expired => {
+            return Ok((
+                "这个问题的手机答复窗口已关闭。用 /threads 看这个会话现在停在哪里。".to_string(),
+                false,
+            ));
+        }
+        crate::state::QuestionStatus::Answered => {
+            return Ok(("这个问题已经回答过了。".to_string(), false));
+        }
+        _ => {}
+    }
+    let checked = crate::state::checked_options(conn, question_id)?;
+    if checked.is_empty() {
+        return Ok(("还没勾选任何选项，先点选项再提交。".to_string(), true));
+    }
+    let labels = checked_labels(&checked, &prompt.options);
+    if !prompt.native_attach {
+        // Held: the blocked hook fills the answer (the native format).
+        let outcome = crate::state::record_question_answer(conn, question_id, &labels, now)?;
+        return Ok((
+            match outcome {
+                ApprovalAnswer::Recorded | ApprovalAnswer::Delivered => format!("已作答：{labels}"),
+                ApprovalAnswer::AlreadyAnswered => "这个问题已经回答过了。".to_string(),
+                ApprovalAnswer::Expired => {
+                    "这个问题的手机答复窗口已关闭。用 /threads 看这个会话现在停在哪里。".to_string()
+                }
+                ApprovalAnswer::Unknown => "这个按钮已经失效了。".to_string(),
+            },
+            false,
+        ));
+    }
+    let Some(batch) = prompt.batch else {
+        return Ok(("这个按钮已经失效了。".to_string(), false));
+    };
+    if prompt.inject_window.is_some() {
+        let (toast, _, _) = stage_interactive_batch_answer(
+            conn,
+            question_id,
+            &prompt,
+            &labels,
+            Some(&checked),
+            now,
+        )?;
+        return Ok((toast, false));
+    }
+    match crate::state::pending_question_status(conn, question_id, now)? {
+        crate::state::QuestionStatus::Open => {}
+        crate::state::QuestionStatus::Delivered => {
+            return Ok(("这题已经送进对话框了，等它提交后记录。".to_string(), false));
+        }
+        crate::state::QuestionStatus::Answered => {
+            return Ok(("这个问题已经回答过了。".to_string(), false));
+        }
+        crate::state::QuestionStatus::Expired => {
+            return Ok(("这个问题的手机答复窗口已关闭。".to_string(), false));
+        }
+        crate::state::QuestionStatus::Missing => {
+            return Ok(("这个按钮已经失效了。".to_string(), false));
+        }
+    }
+    // Durable claim BEFORE the first toggle (Astra r3): the row is delivered
+    // and the whole batch handed to the PC in one transaction, so a crash or
+    // a failed write after any toggle can never let a button retype (and flip
+    // boxes back) or drive the batch further. A clean finish lifts the
+    // hand-off; a zero-key failure undoes the claim.
+    // 电脑优先 (the user's rule): toggles are relative, so the phone may only
+    // type them if the PC keyboard provably has not touched this batch —
+    // since it was asked (the listener's record, live listener only) and
+    // throughout the typing (a live XInput2 fence). Anything else: the PC
+    // has the answer, and the phone's is void.
+    let Some(watch) = crate::fork_dialog::KeyWatch::start() else {
+        declare_pc_won(conn, question_id, &prompt.thread_id, now)?;
+        return Ok((PC_WON.to_string(), false));
+    };
+    let fence_up = crate::now_millis().unwrap_or(u64::MAX);
+    let asked = crate::state::batch_rows(conn, question_id, now)?
+        .map(|b| b.created_at)
+        .unwrap_or(0);
+    if pc_priority_check(conn, question_id, now)?
+        || !crate::approvals::keyboard_untouched_behind_fence(asked, fence_up)
+        || watch.pressed()
+    {
+        declare_pc_won(conn, question_id, &prompt.thread_id, now)?;
+        return Ok((PC_WON.to_string(), false));
+    }
+    let stamp = now;
+    if !crate::state::claim_checked_tab(conn, question_id, stamp)? {
+        return Ok((BATCH_HANDED_OFF.to_string(), false));
+    }
+    let pc_touched = std::cell::Cell::new(false);
+    let still_ours = || {
+        if watch.pressed() {
+            pc_touched.set(true);
+            return false;
+        }
+        crate::state::checked_claim_live(conn, question_id, stamp).unwrap_or(false)
+            && !matches!(
+                crate::state::pending_question_status(conn, question_id, clock()),
+                Ok(crate::state::QuestionStatus::Expired)
+            )
+    };
+    let tab = crate::fork_dialog::MultiTab {
+        seq: batch.seq,
+        total: batch.total,
+    };
+    let seq = batch.seq + 1;
+    let total = batch.total;
+    let _ = crate::fork_dialog::take_enter_sent();
+    crate::state::set_batch_phone_typing(conn, question_id, stamp)?;
+    let outcome =
+        crate::fork_dialog::inject_checked_tab(&prompt.thread_id, &checked, tab, still_ours);
+    let entered = crate::fork_dialog::take_enter_sent();
+    crate::state::clear_batch_phone_typing(conn, question_id, stamp)?;
+    // An ACTIVE last look (Sol r8), as in `pc_fenced` — not once the batch's
+    // Enter went out (Sol r9).
+    if !entered && watch.pressed() {
+        pc_touched.set(true);
+    }
+    if pc_touched.get() {
+        // The PC keyboard moved while we typed: whatever went in, the PC has
+        // the answer. A zero-key outcome gives the row back first; the batch
+        // stays handed off either way.
+        if matches!(
+            outcome,
+            Ok(crate::fork_dialog::InjectOutcome::Unreachable) | Err(_)
+        ) {
+            crate::state::release_checked_tab(conn, question_id, stamp)?;
+        }
+        declare_pc_won(conn, question_id, &prompt.thread_id, now)?;
+        return Ok((PC_WON.to_string(), false));
+    }
+    Ok(match outcome {
+        Ok(crate::fork_dialog::InjectOutcome::Delivered) => {
+            crate::state::finish_checked_tab(conn, question_id, stamp)?;
+            // An auto-submitted batch is the phone's submitted one (Sol r10),
+            // kept past the claim's hand-off being lifted.
+            if entered {
+                if let Some(b) = crate::state::batch_rows(conn, question_id, now)? {
+                    crate::state::mark_batch_submitted(conn, &b.batch_id, &b.thread_id, now)?;
+                }
+            }
+            (
+                    format!(
+                        "已把「{labels}」送进第 {seq}/{total} 问；全部答完会自动提交，或点「提交已答的」。"
+                    ),
+                    false,
+                )
+        }
+        Ok(crate::fork_dialog::InjectOutcome::SubmitPending) => {
+            crate::state::finish_checked_tab(conn, question_id, stamp)?;
+            (
+                    format!(
+                        "已把「{labels}」送进第 {seq}/{total} 问，但对话框还没确认提交——点「提交已答的」可再试。"
+                    ),
+                    false,
+                )
+        }
+        // Only SOME toggles went in: the claim already handed the batch
+        // to the PC — it stays that way (no phone submit, no reminder).
+        Ok(crate::fork_dialog::InjectOutcome::PartlyTyped) => {
+            crate::state::mark_question_tapped(conn, question_id, now)?;
+            (
+                    format!(
+                        "第 {seq}/{total} 问可能只勾上了部分选项——请到电脑上核对这题并提交整组（这组手机上不再提交）。"
+                    ),
+                    false,
+                )
+        }
+        // No key went out: give the claim back.
+        Ok(crate::fork_dialog::InjectOutcome::Unreachable) | Err(_) => {
+            crate::state::release_checked_tab(conn, question_id, stamp)?;
+            (
+                "没能连上对话框，请在电脑窗口作答（未记录，可重试）。".to_string(),
+                true,
+            )
+        }
+    })
+}
+
 fn record_callback_answer(
     conn: &Connection,
     route: &RoutedTelegramCallback,
     now: u64,
 ) -> Result<Value> {
+    // 电脑已抢答: no phone answer of any kind counts for that batch.
+    // The button stays live so every later tap keeps saying so (Sol r7).
+    if let Some(question_id) = route.question_id.as_deref() {
+        if pc_priority_check(conn, question_id, now)? {
+            return Ok(json!({
+                "ok": true,
+                "action": "telegram_question_pc_won",
+                "questionId": question_id,
+                "threadId": route.thread_id,
+                "retryable": false,
+                "keepRoute": true,
+                "toast": PC_WON
+            }));
+        }
+    }
+    // A checkbox of a multi-select question (v0.2.20): tick / untick and
+    // redraw the keyboard; the button stays live.
+    if route.action == TelegramCallbackAction::ToggleOption {
+        return toggle_checkbox(conn, route, now);
+    }
+    // 「提交这题」under the checkboxes.
+    if route.action == TelegramCallbackAction::SubmitChecked {
+        let (toast, retryable) = match route.question_id.as_deref() {
+            Some(question_id) => submit_checked(conn, question_id, now)?,
+            None => ("这个按钮已经失效了。".to_string(), false),
+        };
+        return Ok(json!({
+            "ok": true,
+            "action": "telegram_question_checked_submit",
+            "questionId": route.question_id,
+            "threadId": route.thread_id,
+            "retryable": retryable,
+            // Never consumed: ticks changed after a submit need it again, and
+            // every later tap is judged by the row's own state.
+            "keepRoute": true,
+            "toast": toast
+        }));
+    }
+    // 「提交已答的」(v0.2.20): submit a multi-question batch as answered so far.
+    if route.action == TelegramCallbackAction::SubmitQuestionBatch {
+        let (toast, retryable) = match route.question_id.as_deref() {
+            Some(question_id) => submit_question_batch(conn, question_id, now)?,
+            None => ("这个按钮已经失效了。".to_string(), false),
+        };
+        return Ok(json!({
+            "ok": true,
+            "action": "telegram_question_batch_submit",
+            "questionId": route.question_id,
+            "threadId": route.thread_id,
+            "retryable": retryable,
+            // Judged by the batch's state on every tap (see above).
+            "keepRoute": true,
+            "toast": toast
+        }));
+    }
     // A question button carries the chosen option rather than a permission
     // decision; the blocked hook is waiting on the answer text.
     if let (Some(question_id), Some(answer)) =
@@ -2941,6 +4047,14 @@ fn record_callback_answer(
             };
             (toast, outcome, false)
         };
+        // An interactive batch tab's options are STAGED, not typed, so a
+        // later tap may change its mind (A, B, then A again — Sol r6): its
+        // buttons stay live; every tap is judged by the row's own state.
+        // Every batch tab's buttons stay live (Sol r6/r8): an interactive tab
+        // is only staged, and any batch may later be won by the PC — the
+        // same button must then keep saying so rather than "already used".
+        let keep_route =
+            crate::state::question_prompt(conn, question_id)?.is_some_and(|p| p.batch.is_some());
         return Ok(json!({
             "ok": true,
             "action": "telegram_question_answer",
@@ -2952,6 +4066,7 @@ fn record_callback_answer(
             // A retryable failure (the dialog could not be reached) keeps the
             // button live: the dispatcher does not consume the route.
             "retryable": retryable,
+            "keepRoute": keep_route,
             "toast": toast
         }));
     }
@@ -2968,7 +4083,10 @@ fn record_callback_answer(
         TelegramCallbackAction::Deny => "deny",
         // Reached only if a question button lost its answer text; refuse
         // rather than guess a permission decision from it.
-        TelegramCallbackAction::AnswerQuestion => {
+        TelegramCallbackAction::AnswerQuestion
+        | TelegramCallbackAction::SubmitQuestionBatch
+        | TelegramCallbackAction::ToggleOption
+        | TelegramCallbackAction::SubmitChecked => {
             return Ok(json!({
                 "ok": true,
                 "action": "telegram_callback_incomplete",
@@ -2990,9 +4108,11 @@ fn record_callback_answer(
             TelegramCallbackAction::ApproveSession => {
                 format!("已允许，本会话内 {tool_name} 不再询问。")
             }
-            TelegramCallbackAction::Deny | TelegramCallbackAction::AnswerQuestion => {
-                "已拒绝。".to_string()
-            }
+            TelegramCallbackAction::Deny
+            | TelegramCallbackAction::AnswerQuestion
+            | TelegramCallbackAction::SubmitQuestionBatch
+            | TelegramCallbackAction::ToggleOption
+            | TelegramCallbackAction::SubmitChecked => "已拒绝。".to_string(),
         },
         ApprovalAnswer::AlreadyAnswered => "这条请求已经处理过了。".to_string(),
         ApprovalAnswer::Expired => {
@@ -3130,7 +4250,9 @@ fn answer_pending_question_from_reply(
     // re-replying is a fresh message with its own route, so the retryable bit is
     // only meaningful for the button dispatcher.
     let (notice, outcome, _retryable) = if question_is_native_attach(conn, &question_id)? {
-        inject_native_attach_answer(conn, &question_id, text, now)?
+        let answered = inject_native_attach_answer(conn, &question_id, text, now)?;
+        redraw_question_checkboxes(conn, telegram, &question_id, timeout)?;
+        answered
     } else {
         let outcome = crate::state::record_question_answer(conn, &question_id, text, now)?;
         let notice = match outcome {
@@ -3609,9 +4731,18 @@ fn process_telegram_update_batch(
                         let retryable = answer
                             .get("retryable")
                             .and_then(Value::as_bool)
-                            .unwrap_or(false);
+                            .unwrap_or(false)
+                            // A checkbox can be tapped again (v0.2.20).
+                            || answer.get("keepRoute").and_then(Value::as_bool) == Some(true);
                         if !retryable {
                             mark_telegram_callback_route_used(conn, &route.callback_id, now)?;
+                        }
+                        // A tick redraws the tapped message's checkboxes.
+                        if let (Some(keyboard), Some(message_id)) = (
+                            answer.get("keyboard").filter(|k| !k.is_null()).cloned(),
+                            route_message_id,
+                        ) {
+                            edit_checkbox_markup(telegram, message_id, keyboard, timeout);
                         }
                         let ack = acknowledge_callback_tap(
                             telegram,
@@ -8061,6 +9192,1101 @@ mod tests {
             crate::state::pending_question_status(&conn, "qi2", 2500).expect("status"),
             crate::state::QuestionStatus::Open,
             "row left open for another surface / the hook"
+        );
+    }
+
+    /// Rows of an interactive (XTEST) batch: `(question_id, seq)` of `total`.
+    fn seed_interactive_batch(conn: &Connection, rows: &[(&str, usize)], total: usize) {
+        for (question_id, seq) in rows {
+            crate::state::create_pending_question(
+                conn,
+                question_id,
+                "sess-win",
+                &format!("第{seq}题？"),
+                &["甲".to_string(), "乙".to_string()],
+                false,
+                1000,
+                9_000_000,
+            )
+            .expect("create");
+            crate::state::set_question_batch(conn, question_id, "toolu-b", *seq, total)
+                .expect("batch");
+            crate::state::mark_question_xtest_window(
+                conn,
+                question_id,
+                0x2a526d7,
+                &test_terminal(),
+            )
+            .expect("mark");
+        }
+    }
+
+    fn take_xtest_steps() -> Vec<String> {
+        crate::fork_dialog::XTEST_STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+
+    /// v0.2.20: an interactive batch tab is STAGED on tap — nothing is typed —
+    /// a later tap on another option of the same tab replaces it, and the tap
+    /// that completes the batch types every tab in ONE pass and submits.
+    #[test]
+    fn an_interactive_batch_is_staged_then_typed_in_one_pass_once_complete() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        // Three tabs, all phone-answerable.
+        seed_interactive_batch(&conn, &[("qb0", 0), ("qb1", 1), ("qb2", 2)], 3);
+        std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
+        let _ = take_xtest_steps();
+
+        let (toast, _, retryable) =
+            inject_native_attach_answer(&conn, "qb0", "乙", 2000).expect("tap 1");
+        assert_eq!(
+            toast,
+            "已记下第 1/3 问：乙（已答 1/3 题）。全部答完会自动提交，或点「提交已答的」。"
+        );
+        assert!(!retryable);
+        assert!(take_xtest_steps().is_empty(), "staged, not typed");
+        // Changed its mind on the same tab.
+        inject_native_attach_answer(&conn, "qb0", "甲", 2100).expect("tap 1 again");
+        assert!(take_xtest_steps().is_empty());
+
+        inject_native_attach_answer(&conn, "qb1", "乙", 2150).expect("tap 2");
+        assert!(take_xtest_steps().is_empty());
+        let (toast, _, _) = inject_native_attach_answer(&conn, "qb2", "乙", 2200).expect("tap 3");
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+        assert_eq!(
+            toast,
+            "已记下第 3/3 问：乙；已把 3/3 题的答案送进电脑上的对话框并提交，由它确认后记录。"
+        );
+        assert_eq!(
+            take_xtest_steps(),
+            [
+                "push",
+                "set",
+                "find tinyctb-mark",
+                "focus 44377815 tinyctb-mark",
+                "batch 44377815 tinyctb-mark L,L,L,1,2,2,R",
+                "enter 44377815 tinyctb-mark",
+                "pop"
+            ]
+        );
+        for id in ["qb0", "qb1", "qb2"] {
+            assert_eq!(
+                crate::state::pending_question_status(&conn, id, 2500).expect("status"),
+                crate::state::QuestionStatus::Delivered
+            );
+            assert!(crate::state::question_answer(&conn, id)
+                .expect("answer")
+                .is_none());
+        }
+        // A late tap types nothing more.
+        let (toast, _, _) = inject_native_attach_answer(&conn, "qb0", "乙", 2600).expect("late");
+        assert_eq!(toast, "这组题已经送进电脑上的对话框了，等它确认后记录。");
+        assert!(take_xtest_steps().is_empty());
+    }
+
+    /// Sol r5: an interactive batch with a multi-select tab is NOT typed if
+    /// the keyboard was touched since it was asked (or that cannot be told):
+    /// a box ticked at the PC would be flipped by a relative toggle. Nothing
+    /// is typed and the batch stays open for the PC.
+    #[test]
+    fn interactive_toggles_are_refused_after_keyboard_activity() {
+        for activity in ["touched", ""] {
+            let _guard = crate::state::test_env_lock();
+            let conn = crate::state::create_state_db_in_memory().expect("db");
+            let options = ["奶酪".to_string(), "火腿".to_string()];
+            crate::state::create_pending_question(
+                &conn,
+                "qa0",
+                "sess-win",
+                "配料？",
+                &options,
+                true,
+                1000,
+                9_000_000,
+            )
+            .expect("create");
+            crate::state::set_question_batch(&conn, "qa0", "toolu-a", 0, 2).expect("batch");
+            crate::state::mark_question_xtest_window(&conn, "qa0", 0x2a526d7, &test_terminal())
+                .expect("mark");
+            seed_interactive_batch(&conn, &[("qa1", 1)], 2);
+            crate::state::set_question_batch(&conn, "qa1", "toolu-a", 1, 2).expect("same batch");
+            crate::state::set_checked_options(&conn, "qa0", &[0]).expect("tick");
+            assert!(crate::state::stage_batch_answer(&conn, "qa0", "奶酪", 1500).expect("stage"));
+            std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
+            let _ = take_xtest_steps();
+            let _seam = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", activity);
+            let (toast, _) = submit_question_batch(&conn, "qa1", 2000).expect("submit");
+            std::env::remove_var("TINYCTB_TEST_XTEST");
+            assert_eq!(toast, PC_WON, "{activity}");
+            assert!(take_xtest_steps().is_empty(), "{activity}: nothing typed");
+            assert!(
+                crate::state::batch_pc_won(&conn, "qa1").expect("won"),
+                "{activity}"
+            );
+            // Every later phone answer to the batch is void.
+            let (toast, _, _) = inject_native_attach_answer(&conn, "qa1", "甲", 2100).expect("tap");
+            assert_eq!(toast, PC_WON);
+            let notices: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM outbound_events WHERE payload_json LIKE '%电脑已抢答%'
+                       AND event_type = 'bridge_notice'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("notices");
+            assert_eq!(notices, 1, "{activity}: one notice");
+        }
+    }
+
+    /// Sol r15: an expired multi-select question with no ticks hears the
+    /// window closed on「提交这题」, not "go tick boxes first".
+    #[test]
+    fn submitting_unticked_expired_checkboxes_says_the_window_closed() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = vec!["甲".to_string(), "乙".to_string()];
+        crate::state::create_pending_question(
+            &conn, "qc", "sess-x", "选？", &options, true, 1000, 2000,
+        )
+        .expect("create");
+        let (toast, retryable) = submit_checked(&conn, "qc", 3_000_000).expect("submit");
+        assert!(toast.starts_with("这个问题的手机答复窗口已关闭"), "{toast}");
+        assert!(!retryable);
+        let (toast, _) = submit_checked(&conn, "qc", 1500).expect("open");
+        assert_eq!(toast, "还没勾选任何选项，先点选项再提交。");
+    }
+
+    /// Sol r14: a batch closed by its deadline marker is reported as a
+    /// closed window on「提交已答的」, never as「已经提交过了」.
+    #[test]
+    fn submitting_an_expired_batch_says_the_window_closed() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = vec!["甲".to_string(), "乙".to_string()];
+        for (id, seq) in [("qe0", 0usize), ("qe1", 1)] {
+            crate::state::create_pending_question(
+                &conn, id, "sess-x", "选？", &options, false, 1000, 2000,
+            )
+            .expect("create");
+            crate::state::set_question_batch(&conn, id, "toolu-e", seq, 2).expect("batch");
+        }
+        conn.execute(
+            "UPDATE pending_questions SET answer = ?1",
+            [crate::state::QUESTION_EXPIRED],
+        )
+        .expect("expire");
+        let (toast, retryable) = submit_question_batch(&conn, "qe0", 3_000_000).expect("submit");
+        assert!(toast.starts_with("这组题的手机答复窗口已关闭"), "{toast}");
+        assert!(!retryable);
+    }
+
+    /// Sol r12: an EXPIRED batch is never declared PC-won by a late tap,
+    /// even with the keyboard used since — the tap hears the window closed.
+    #[test]
+    fn an_expired_batch_is_not_declared_pc_won() {
+        let _guard = crate::state::test_env_lock();
+        let _touched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "touched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = vec!["甲".to_string(), "乙".to_string()];
+        for (id, seq) in [("qx0", 0usize), ("qx1", 1)] {
+            crate::state::create_pending_question(
+                &conn, id, "sess-x", "选？", &options, false, 1000, 2000,
+            )
+            .expect("create");
+            crate::state::set_question_batch(&conn, id, "toolu-x", seq, 2).expect("batch");
+        }
+        assert!(!pc_priority_check(&conn, "qx0", 3_000_000).expect("check"));
+        assert!(!crate::state::batch_pc_won(&conn, "qx0").expect("won"));
+        // Still open: the same tap with the keyboard touched IS the PC's.
+        assert!(pc_priority_check(&conn, "qx0", 1500).expect("check open"));
+    }
+
+    /// Sol r6: an interactive batch tab's option buttons stay live (staged,
+    /// not typed), so A, B, then A again leaves A staged.
+    #[test]
+    fn an_interactive_batch_tab_can_change_its_answer_back() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        seed_interactive_batch(&conn, &[("qz0", 0), ("qz1", 1)], 2);
+        let tap = |label: &str| {
+            record_callback_answer(
+                &conn,
+                &RoutedTelegramCallback {
+                    callback_query_id: "cq".to_string(),
+                    callback_id: format!("cb-{label}"),
+                    thread_id: "sess-win".to_string(),
+                    action: TelegramCallbackAction::AnswerQuestion,
+                    approval_id: None,
+                    question_id: Some("qz0".to_string()),
+                    answer: Some(label.to_string()),
+                },
+                2000,
+            )
+            .expect("tap")
+        };
+        for label in ["甲", "乙", "甲"] {
+            assert_eq!(tap(label)["keepRoute"], true, "{label}");
+        }
+        let batch = crate::state::batch_rows(&conn, "qz0", 2500)
+            .expect("rows")
+            .expect("batch");
+        assert_eq!(batch.tabs[0].staged_answer.as_deref(), Some("甲"));
+    }
+
+    /// Sol r6: a withheld Return reads as "submitted at the PC" ONLY when the
+    /// rows confirm an answer; otherwise the phone is told to check the PC.
+    #[test]
+    fn a_withheld_return_is_not_mistaken_for_a_pc_submit() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        seed_interactive_batch(&conn, &[("qw0", 0), ("qw1", 1)], 2);
+        std::env::set_var("TINYCTB_TEST_XTEST", "enter");
+        inject_native_attach_answer(&conn, "qw0", "甲", 2000).expect("tap 1");
+        let (toast, _, _) = inject_native_attach_answer(&conn, "qw1", "乙", 2100).expect("tap 2");
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+        // The helper refused the Return (focus / mark gone): not submitted,
+        // never claimed as "submitted at the PC", and the PC's under 电脑优先.
+        assert!(!toast.contains("电脑上已经提交"), "{toast}");
+        assert!(toast.ends_with(PC_WON), "{toast}");
+    }
+
+    /// 电脑优先 (the user's rule) on a fork's multi-select tab: no live fence,
+    /// keyboard history, or a key during the typing — the PC wins the batch,
+    /// the phone answer is void and every later phone tap says so.
+    #[test]
+    fn a_fork_checked_tab_yields_to_the_pc_keyboard() {
+        for (watch, history) in [
+            ("none", "untouched"),
+            ("clean", "touched"),
+            ("pressed", "untouched"),
+        ] {
+            let _guard = crate::state::test_env_lock();
+            let conn = crate::state::create_state_db_in_memory().expect("db");
+            let options = ["奶酪".to_string(), "火腿".to_string()];
+            for (id, seq) in [("fw0", 0usize), ("fw1", 1)] {
+                crate::state::create_pending_question(
+                    &conn,
+                    id,
+                    "sess-fork",
+                    "配料？",
+                    &options,
+                    true,
+                    1000,
+                    9_000_000,
+                )
+                .expect("create");
+                crate::state::set_question_batch(&conn, id, "toolu-fw", seq, 2).expect("batch");
+                crate::state::mark_question_native_attach(&conn, id).expect("native");
+            }
+            crate::state::set_checked_options(&conn, "fw0", &[1]).expect("tick");
+            let _w = crate::state::EnvVarGuard::set("TINYCTB_TEST_KEYWATCH", watch);
+            let _h = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", history);
+            let _a = crate::state::EnvVarGuard::set("TINYCTB_TEST_ATTACH", "/nonexistent/attach");
+            let (toast, retryable) = submit_checked(&conn, "fw0", 2000).expect("submit");
+            assert_eq!(toast, PC_WON, "{watch}/{history}");
+            assert!(!retryable);
+            assert!(crate::state::batch_pc_won(&conn, "fw1").expect("won"));
+            // The tab typed nothing: its row is open again, but the batch is
+            // the PC's.
+            assert_eq!(
+                crate::state::pending_question_status(&conn, "fw0", 2500).expect("status"),
+                crate::state::QuestionStatus::Open,
+                "{watch}/{history}"
+            );
+            let routed = RoutedTelegramCallback {
+                callback_query_id: "cq".to_string(),
+                callback_id: "cb".to_string(),
+                thread_id: "sess-fork".to_string(),
+                action: TelegramCallbackAction::ToggleOption,
+                approval_id: None,
+                question_id: Some("fw1".to_string()),
+                answer: Some("奶酪".to_string()),
+            };
+            let reply = record_callback_answer(&conn, &routed, 2600).expect("tap");
+            assert_eq!(reply["toast"], PC_WON);
+        }
+    }
+
+    /// 电脑优先, widened to single-select (the user, 2026-11-23): once the PC
+    /// keyboard was touched after a batch was asked, a phone tap on ANY of
+    /// its tabs is void — nothing is staged or typed — and the button keeps
+    /// saying so on every tap.
+    #[test]
+    fn a_single_select_batch_yields_to_the_pc_keyboard() {
+        let _guard = crate::state::test_env_lock();
+        let _touched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "touched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        seed_interactive_batch(&conn, &[("qs0", 0), ("qs1", 1)], 2);
+        let tap = || {
+            record_callback_answer(
+                &conn,
+                &RoutedTelegramCallback {
+                    callback_query_id: "cq".to_string(),
+                    callback_id: "cb".to_string(),
+                    thread_id: "sess-win".to_string(),
+                    action: TelegramCallbackAction::AnswerQuestion,
+                    approval_id: None,
+                    question_id: Some("qs0".to_string()),
+                    answer: Some("甲".to_string()),
+                },
+                2000,
+            )
+            .expect("tap")
+        };
+        for _ in 0..2 {
+            let reply = tap();
+            assert_eq!(reply["toast"], PC_WON);
+            assert_eq!(reply["keepRoute"], true);
+        }
+        let batch = crate::state::batch_rows(&conn, "qs0", 2500)
+            .expect("rows")
+            .expect("batch");
+        assert!(
+            batch.tabs.iter().all(|t| t.staged_answer.is_none()),
+            "nothing staged"
+        );
+        assert!(crate::state::batch_pc_won(&conn, "qs1").expect("won"));
+    }
+
+    /// 电脑优先 on a fork's single-select tab: a PC key seen by the live
+    /// fence voids the phone tap.
+    #[test]
+    fn a_fork_single_select_tab_yields_to_the_pc_fence() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let _watch = crate::state::EnvVarGuard::set("TINYCTB_TEST_KEYWATCH", "pressed");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        for (id, seq) in [("ft0", 0usize), ("ft1", 1)] {
+            crate::state::create_pending_question(
+                &conn,
+                id,
+                "sess-fork",
+                "q",
+                &["甲".to_string(), "乙".to_string()],
+                false,
+                1000,
+                9_000_000,
+            )
+            .expect("create");
+            crate::state::set_question_batch(&conn, id, "toolu-ft", seq, 2).expect("batch");
+            crate::state::mark_question_native_attach(&conn, id).expect("native");
+        }
+        let (toast, _, retryable) =
+            inject_native_attach_answer(&conn, "ft0", "乙", 2000).expect("tap");
+        assert_eq!(toast, PC_WON);
+        assert!(!retryable);
+        assert!(crate::state::batch_pc_won(&conn, "ft1").expect("won"));
+        assert_eq!(
+            crate::state::pending_question_status(&conn, "ft0", 2500).expect("status"),
+            crate::state::QuestionStatus::Open,
+            "nothing typed, nothing delivered"
+        );
+    }
+
+    /// Sol r8: a batch the phone already submitted is not "won by the PC"
+    /// after the fact when the keyboard moves later — its old buttons say it
+    /// was submitted.
+    #[test]
+    fn a_phone_submitted_batch_is_not_declared_the_pcs_later() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        seed_interactive_batch(&conn, &[("qd0", 0), ("qd1", 1)], 2);
+        crate::state::mark_batch_submitted(&conn, "toolu-b", "sess-win", 1500).expect("submitted");
+        let _touched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "touched");
+        assert!(!pc_priority_check(&conn, "qd0", 2000).expect("check"));
+        let (toast, _) = submit_question_batch(&conn, "qd0", 2000).expect("submit again");
+        assert_eq!(toast, BATCH_HANDED_OFF);
+        assert!(!crate::state::batch_pc_won(&conn, "qd1").expect("not won"));
+    }
+
+    /// Sol r10: a fork injection that pressed the batch's Enter (an
+    /// auto-submit) makes the batch the phone's submitted one — a later PC
+    /// key or sweep never declares it the PC's, even before PostToolUse; and
+    /// while the phone types, the batch is not "waiting" for a PostToolUse.
+    #[test]
+    fn an_auto_submitted_fork_batch_stays_the_phones() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        for (id, seq) in [("fa0", 0usize), ("fa1", 1)] {
+            crate::state::create_pending_question(
+                &conn,
+                id,
+                "sess-fork",
+                "q",
+                &["甲".to_string(), "乙".to_string()],
+                false,
+                1000,
+                9_000_000,
+            )
+            .expect("create");
+            crate::state::set_question_batch(&conn, id, "toolu-fa", seq, 2).expect("batch");
+            crate::state::mark_question_native_attach(&conn, id).expect("native");
+        }
+        let (outcome, won) = pc_fenced(&conn, "fa1", "sess-fork", 2000, |_clear| {
+            // Mid-injection: the batch is the phone's, not waiting.
+            let waiting = crate::state::waiting_batches_for_thread(&conn, "sess-fork", 2000)
+                .expect("waiting");
+            crate::fork_dialog::note_enter_sent();
+            waiting
+        })
+        .expect("fenced");
+        assert!(!won);
+        assert_eq!(outcome, Some(Vec::<String>::new()), "typing → not waiting");
+        assert!(crate::state::batch_submitted(&conn, "fa0").expect("submitted"));
+        assert!(crate::state::live_batches(&conn, 2500)
+            .expect("live")
+            .is_empty());
+        let _touched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "touched");
+        assert!(!pc_priority_check(&conn, "fa0", 3000).expect("check"));
+        assert!(!crate::state::batch_pc_won(&conn, "fa0").expect("not won"));
+    }
+
+    /// Sol r10: a batch answered at the PC between two sweeps is still
+    /// declared the PC's — with its notice — when the session's PostToolUse
+    /// records the answer.
+    #[test]
+    fn a_batch_answered_at_the_pc_is_declared_at_post_tool_use() {
+        let _guard = crate::state::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("tinyctb-hook-pc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &dir);
+        let db = crate::state::state_db_path().expect("db path");
+        let conn = crate::state::create_state_db(&db).expect("db");
+        for (id, seq) in [("hp0", 0usize), ("hp1", 1)] {
+            crate::state::create_pending_question(
+                &conn,
+                id,
+                "sess-pc",
+                &format!("题{seq}？"),
+                &["甲".to_string(), "乙".to_string()],
+                false,
+                1000,
+                9_000_000,
+            )
+            .expect("create");
+            crate::state::set_question_batch(&conn, id, "toolu-hp", seq, 2).expect("batch");
+            crate::state::mark_question_native_attach(&conn, id).expect("native");
+        }
+        let payload = json!({
+            "tool_name": "AskUserQuestion",
+            "session_id": "sess-pc",
+            "tool_response": {"answers": {"题0？": "甲", "题1？": "乙"}}
+        })
+        .to_string();
+        crate::approvals::run_question_answered_gate(&mut payload.as_bytes(), 1500).expect("gate");
+        assert!(crate::state::batch_pc_won(&conn, "hp0").expect("won"));
+        let notices: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events
+                 WHERE event_type = 'bridge_notice' AND payload_json LIKE '%电脑已抢答%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("notices");
+        assert_eq!(notices, 1);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Sol r4: when the dialog also has a tab only the PC can answer (no
+    /// row — free text, say), answering every phone tab does NOT auto-submit:
+    /// the phone is told which tab is left, and only「提交已答的」submits.
+    #[test]
+    fn a_batch_with_a_pc_only_tab_is_not_auto_submitted() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        seed_interactive_batch(&conn, &[("qo0", 0), ("qo2", 2)], 3);
+        std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
+        let _ = take_xtest_steps();
+        inject_native_attach_answer(&conn, "qo0", "甲", 2000).expect("tap 1");
+        let (toast, _, _) = inject_native_attach_answer(&conn, "qo2", "乙", 2100).expect("tap 2");
+        assert!(toast.contains("第 2 问只能在电脑上答"), "{toast}");
+        assert!(take_xtest_steps().is_empty(), "not auto-submitted");
+        let (toast, _) = submit_question_batch(&conn, "qo0", 2200).expect("submit");
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+        assert_eq!(
+            toast,
+            "已把 2/3 题的答案送进电脑上的对话框并提交，由它确认后记录。"
+        );
+        assert!(
+            take_xtest_steps().contains(&"batch 44377815 tinyctb-mark L,L,L,1,R,2,R".to_string())
+        );
+    }
+
+    /// Sol r4: ticked boxes reach the batch pass as INDEXES — options `A`,
+    /// `B`, `A, B` with A and B ticked type toggles 1 and 2, never option 3
+    /// (whose label equals their joined labels).
+    #[test]
+    fn ticked_boxes_are_staged_as_indexes_not_rejoined_labels() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = ["A".to_string(), "B".to_string(), "A, B".to_string()];
+        crate::state::create_pending_question(
+            &conn,
+            "qk0",
+            "sess-win",
+            "哪些？",
+            &options,
+            true,
+            1000,
+            9_000_000,
+        )
+        .expect("create");
+        crate::state::set_question_batch(&conn, "qk0", "toolu-k", 0, 2).expect("batch");
+        crate::state::mark_question_xtest_window(&conn, "qk0", 0x2a526d7, &test_terminal())
+            .expect("mark");
+        crate::approvals::checkbox_buttons(&conn, "999", "sess-win", "qk0", &options, 1000)
+            .expect("buttons");
+        seed_interactive_batch(&conn, &[("qk1", 1)], 2);
+        crate::state::set_question_batch(&conn, "qk1", "toolu-k", 1, 2).expect("same batch");
+        std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
+        let _ = take_xtest_steps();
+        for label in ["A", "B"] {
+            record_callback_answer(&conn, &checkbox_route(&conn, "qk0", Some(label)), 2000)
+                .expect("tick");
+        }
+        record_callback_answer(&conn, &checkbox_route(&conn, "qk0", None), 2100).expect("submit");
+        assert_eq!(
+            crate::state::checked_options(&conn, "qk0").expect("ticks"),
+            vec![0, 1]
+        );
+        inject_native_attach_answer(&conn, "qk1", "甲", 2200).expect("tap");
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+        assert!(
+            take_xtest_steps().contains(&"batch 44377815 tinyctb-mark L,L,1,2,R,1,R".to_string())
+        );
+    }
+
+    /// v0.2.20:「提交已答的」on an interactive batch types the staged tabs,
+    /// skips the rest and submits; a second tap does nothing. With nothing
+    /// staged it refuses (and stays live).
+    #[test]
+    fn the_submit_button_types_a_partial_interactive_batch() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        seed_interactive_batch(&conn, &[("qp0", 0), ("qp1", 1)], 2);
+        std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
+        let _ = take_xtest_steps();
+
+        let (toast, retryable) = submit_question_batch(&conn, "qp1", 1500).expect("empty");
+        assert_eq!(toast, "还没有任何题答了，先点题目的选项。");
+        assert!(retryable);
+        assert!(take_xtest_steps().is_empty());
+
+        inject_native_attach_answer(&conn, "qp1", "乙", 2000).expect("tap");
+        let (toast, retryable) = submit_question_batch(&conn, "qp0", 2100).expect("submit");
+        assert_eq!(
+            toast,
+            "已把 1/2 题的答案送进电脑上的对话框并提交，由它确认后记录。"
+        );
+        assert!(!retryable);
+        assert!(take_xtest_steps().contains(&"batch 44377815 tinyctb-mark L,L,R,2,R".to_string()));
+
+        let (toast, retryable) = submit_question_batch(&conn, "qp0", 2200).expect("again");
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+        assert_eq!(toast, BATCH_HANDED_OFF);
+        assert!(!retryable);
+        assert!(take_xtest_steps().is_empty());
+    }
+
+    /// v0.2.20: a batch pass that cannot reach the window types nothing, keeps
+    /// the staged answers and leaves the batch open for a retry.
+    #[test]
+    fn an_unreachable_batch_pass_keeps_the_staged_answers() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        seed_interactive_batch(&conn, &[("qu0", 0), ("qu1", 1)], 2);
+        std::env::set_var("TINYCTB_TEST_XTEST", "focus");
+        inject_native_attach_answer(&conn, "qu0", "甲", 2000).expect("tap");
+        let (toast, retryable) = submit_question_batch(&conn, "qu0", 2100).expect("submit");
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+        assert!(toast.starts_with("没能送进电脑上的对话框"), "{toast}");
+        assert!(retryable);
+        let batch = crate::state::batch_rows(&conn, "qu0", 2200)
+            .expect("rows")
+            .expect("batch");
+        assert!(batch.live());
+        assert_eq!(batch.tabs[0].staged_answer.as_deref(), Some("甲"));
+        assert!(batch.tabs.iter().all(|t| !t.delivered));
+    }
+
+    fn checkbox_route(
+        conn: &Connection,
+        question_id: &str,
+        answer: Option<&str>,
+    ) -> RoutedTelegramCallback {
+        let (callback_id, action): (String, String) = conn
+            .query_row(
+                "SELECT callback_id, action FROM telegram_callback_routes
+                 WHERE question_id = ?1 AND action = ?2 AND answer IS ?3",
+                rusqlite::params![
+                    question_id,
+                    if answer.is_some() {
+                        "toggle_option"
+                    } else {
+                        "submit_checked"
+                    },
+                    answer
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("route");
+        RoutedTelegramCallback {
+            callback_query_id: "cq".to_string(),
+            callback_id,
+            thread_id: "sess-win".to_string(),
+            action: TelegramCallbackAction::from_str(&action).expect("action"),
+            approval_id: None,
+            question_id: Some(question_id.to_string()),
+            answer: answer.map(str::to_string),
+        }
+    }
+
+    /// Sol r12: a typed reply that changed the ticks redraws the checkbox
+    /// message, so what is on screen matches what the next tap toggles.
+    #[test]
+    fn a_typed_reply_redraws_the_checkbox_message() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = ["奶酪".to_string(), "火腿".to_string(), "橄榄".to_string()];
+        crate::state::create_pending_question(
+            &conn,
+            "qr",
+            "sess-win",
+            "配料？",
+            &options,
+            true,
+            1000,
+            9_000_000,
+        )
+        .expect("create");
+        crate::approvals::checkbox_buttons(&conn, "999", "sess-win", "qr", &options, 1000)
+            .expect("buttons");
+        conn.execute(
+            "UPDATE telegram_callback_routes SET message_id = 77 WHERE question_id = 'qr'",
+            [],
+        )
+        .expect("sent");
+        crate::state::set_checked_options(&conn, "qr", &[0, 2]).expect("typed A,C");
+        let telegram = test_daemon_config().telegram.expect("telegram");
+        let _probe = crate::telegram::api::outbound_probe::arm_acting(|| {});
+        redraw_question_checkboxes(&conn, &telegram, "qr", Duration::from_secs(1)).expect("redraw");
+        let sent = crate::telegram::api::outbound_probe::sent();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, "editMessageReplyMarkup");
+        assert_eq!(sent[0].1["message_id"], 77);
+        let texts: Vec<String> = sent[0].1["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| row[0]["text"].as_str().expect("text").to_string())
+            .collect();
+        assert!(
+            texts[0].starts_with('✅') && texts[2].starts_with('✅'),
+            "{texts:?}"
+        );
+        assert!(texts[1].starts_with('⬜'), "{texts:?}");
+    }
+
+    /// Sol r18: a typed reply to an expired fork multi-select tab changes no
+    /// ticks — it only hears the window closed.
+    #[test]
+    fn a_typed_reply_to_an_expired_fork_checkbox_tab_ticks_nothing() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = vec!["甲".to_string(), "乙".to_string()];
+        for (id, seq) in [("qy0", 0usize), ("qy1", 1)] {
+            crate::state::create_pending_question(
+                &conn, id, "sess-f", "选？", &options, true, 1000, 2000,
+            )
+            .expect("create");
+            crate::state::set_question_batch(&conn, id, "toolu-y", seq, 2).expect("batch");
+            crate::state::mark_question_native_attach(&conn, id).expect("native");
+        }
+        let (toast, outcome, _) =
+            inject_native_attach_answer(&conn, "qy0", "A", 3_000_000).expect("reply");
+        assert_eq!(toast, "这个问题的手机答复窗口已关闭。");
+        assert!(matches!(outcome, ApprovalAnswer::Expired));
+        assert!(crate::state::checked_options(&conn, "qy0")
+            .expect("ticks")
+            .is_empty());
+    }
+
+    /// Sol r17: the in-flight clock moves with wall time in `now`'s unit, so
+    /// a deadline that passes mid-injection is seen by the pre-Enter check.
+    #[test]
+    fn the_live_clock_advances_in_the_callers_unit() {
+        let ms = live_clock(1_800_000_000_000);
+        let secs = live_clock(2_000);
+        std::thread::sleep(Duration::from_millis(1_100));
+        let advanced = ms() - 1_800_000_000_000;
+        assert!((1_000..5_000).contains(&advanced), "{advanced}");
+        assert!((1..5).contains(&(secs() - 2_000)));
+    }
+
+    /// Sol r16: two options with the same label — each checkbox toggles its
+    /// OWN box (by button position), and the redraw shows that.
+    #[test]
+    fn same_label_checkboxes_toggle_their_own_box() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = ["同名".to_string(), "同名".to_string(), "别的".to_string()];
+        crate::state::create_pending_question(
+            &conn, "qd", "sess-win", "选？", &options, true, 1000, 9_000_000,
+        )
+        .expect("create");
+        crate::approvals::checkbox_buttons(&conn, "999", "sess-win", "qd", &options, 1000)
+            .expect("buttons");
+        let ids: Vec<String> = conn
+            .prepare(
+                "SELECT callback_id FROM telegram_callback_routes
+                 WHERE question_id = 'qd' AND action = 'toggle_option' ORDER BY rowid",
+            )
+            .expect("prepare")
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("ids");
+        let second = RoutedTelegramCallback {
+            callback_query_id: "cq".to_string(),
+            callback_id: ids[1].clone(),
+            thread_id: "sess-win".to_string(),
+            action: TelegramCallbackAction::ToggleOption,
+            approval_id: None,
+            question_id: Some("qd".to_string()),
+            answer: Some("同名".to_string()),
+        };
+        let answer = record_callback_answer(&conn, &second, 2000).expect("toggle");
+        assert_eq!(
+            crate::state::checked_options(&conn, "qd").expect("ticks"),
+            vec![1]
+        );
+        let texts: Vec<String> = answer["keyboard"]["inline_keyboard"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| row[0]["text"].as_str().expect("text").to_string())
+            .collect();
+        assert!(
+            texts[0].starts_with('⬜') && texts[1].starts_with('✅'),
+            "{texts:?}"
+        );
+    }
+
+    /// v0.2.20: a held multi-select question — ticks toggle and redraw the
+    /// keyboard (the button stays live), an empty submit is refused, and the
+    /// submit records the ticked labels in the native `a, b` form.
+    #[test]
+    fn checkboxes_toggle_redraw_and_submit_a_held_multi_select_question() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = ["奶酪".to_string(), "火腿".to_string(), "橄榄".to_string()];
+        crate::state::create_pending_question(
+            &conn,
+            "qm",
+            "sess-win",
+            "配料？",
+            &options,
+            true,
+            1000,
+            9_000_000,
+        )
+        .expect("create");
+        crate::approvals::checkbox_buttons(&conn, "999", "sess-win", "qm", &options, 1000)
+            .expect("buttons");
+
+        let submit = checkbox_route(&conn, "qm", None);
+        let empty = record_callback_answer(&conn, &submit, 1500).expect("empty submit");
+        assert_eq!(empty["toast"], "还没勾选任何选项，先点选项再提交。");
+        assert_eq!(empty["retryable"], true);
+
+        let tick = |label: &str| {
+            record_callback_answer(&conn, &checkbox_route(&conn, "qm", Some(label)), 2000)
+                .expect("tick")
+        };
+        tick("奶酪");
+        tick("橄榄");
+        let untick = tick("奶酪");
+        assert_eq!(untick["toast"], "已取消：奶酪。现在勾选的是：橄榄");
+        assert_eq!(untick["keepRoute"], true);
+        let rows = untick["keyboard"]["inline_keyboard"]
+            .as_array()
+            .expect("rows");
+        let texts: Vec<&str> = rows
+            .iter()
+            .map(|r| r[0]["text"].as_str().expect("text"))
+            .collect();
+        assert_eq!(
+            texts,
+            ["⬜ A 奶酪", "⬜ B 火腿", "✅ C 橄榄", "📨 提交这题"]
+        );
+        tick("火腿");
+
+        let done = record_callback_answer(&conn, &submit, 3000).expect("submit");
+        assert_eq!(done["toast"], "已作答：火腿, 橄榄");
+        assert_eq!(done["retryable"], false);
+        assert_eq!(
+            crate::state::question_answer(&conn, "qm")
+                .expect("answer")
+                .as_deref(),
+            Some("火腿, 橄榄")
+        );
+        let late = tick("奶酪");
+        assert_eq!(late["toast"], "这个问题已经回答过了。");
+    }
+
+    /// v0.2.20 (Astra r1): a multi-select reply is parsed token by token —
+    /// letters (any case), labels, and both mixed.
+    #[test]
+    fn a_multi_select_reply_accepts_letters_labels_and_both() {
+        let options = ["奶酪".to_string(), "火腿".to_string(), "橄榄".to_string()];
+        assert_eq!(checked_from_answer("A,C", &options), Some(vec![0, 2]));
+        assert_eq!(checked_from_answer("c, a", &options), Some(vec![0, 2]));
+        assert_eq!(checked_from_answer("A，橄榄", &options), Some(vec![0, 2]));
+        assert_eq!(checked_from_answer("火腿", &options), Some(vec![1]));
+        assert_eq!(checked_from_answer("A,Z", &options), None);
+        assert_eq!(checked_from_answer(" , ", &options), None);
+        // Sol r14: a letter is the button letter, even when a label is one.
+        let tricky = [
+            "O".to_string(),
+            "A".to_string(),
+            "B".to_string(),
+            "AB".to_string(),
+        ];
+        assert_eq!(checked_from_answer("A", &tricky), Some(vec![0]));
+        assert_eq!(checked_from_answer("a, d", &tricky), Some(vec![0, 3]));
+        assert_eq!(checked_from_answer("AB", &tricky), Some(vec![3]));
+        assert_eq!(checked_from_answer("O", &tricky), Some(vec![0]));
+        // Sol r15: a list of button letters beats a label that spells it.
+        let listy = ["A".to_string(), "B".to_string(), "A, B".to_string()];
+        assert_eq!(checked_from_answer("A, B", &listy), Some(vec![0, 1]));
+        assert_eq!(checked_from_answer("c", &listy), Some(vec![2]));
+    }
+
+    /// v0.2.20 (Astra r1): on an interactive batch tab,「提交这题」stays live —
+    /// submit, change the ticks (which un-stages the tab), submit again — and
+    /// the batch pass types the NEW ticks.
+    #[test]
+    fn an_interactive_multi_select_tab_can_be_resubmitted_after_changing_ticks() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = ["奶酪".to_string(), "火腿".to_string(), "橄榄".to_string()];
+        crate::state::create_pending_question(
+            &conn,
+            "qr0",
+            "sess-win",
+            "配料？",
+            &options,
+            true,
+            1000,
+            9_000_000,
+        )
+        .expect("create");
+        crate::state::set_question_batch(&conn, "qr0", "toolu-r", 0, 2).expect("batch");
+        crate::state::mark_question_xtest_window(&conn, "qr0", 0x2a526d7, &test_terminal())
+            .expect("mark");
+        crate::approvals::checkbox_buttons(&conn, "999", "sess-win", "qr0", &options, 1000)
+            .expect("buttons");
+        seed_interactive_batch(&conn, &[("qr1", 1)], 2);
+        crate::state::set_question_batch(&conn, "qr1", "toolu-r", 1, 2).expect("same batch");
+        std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
+        let _ = take_xtest_steps();
+        let tick = |label: &str| {
+            record_callback_answer(&conn, &checkbox_route(&conn, "qr0", Some(label)), 2000)
+                .expect("tick")
+        };
+        let submit = || {
+            record_callback_answer(&conn, &checkbox_route(&conn, "qr0", None), 2100)
+                .expect("submit")
+        };
+        tick("奶酪");
+        assert_eq!(
+            submit()["keepRoute"],
+            true,
+            "the submit button is never consumed"
+        );
+        let changed = tick("火腿");
+        assert!(
+            changed["toast"]
+                .as_str()
+                .expect("toast")
+                .contains("需要重新点「提交这题」"),
+            "{changed}"
+        );
+        let again = submit();
+        assert!(
+            again["toast"]
+                .as_str()
+                .expect("toast")
+                .starts_with("已记下第 1/2 问：奶酪, 火腿"),
+            "{again}"
+        );
+        inject_native_attach_answer(&conn, "qr1", "甲", 2200).expect("tap");
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+        assert!(
+            take_xtest_steps().contains(&"batch 44377815 tinyctb-mark L,L,1,2,R,1,R".to_string())
+        );
+    }
+
+    /// v0.2.20 (Astra r2): once a fork batch is submitted (or handed to the
+    /// PC), an old button on one of its unanswered tabs drives nothing — no
+    /// attach is even attempted — and says so.
+    #[test]
+    fn a_submitted_fork_batch_refuses_its_old_buttons() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        for (id, seq) in [("fs0", 0usize), ("fs1", 1)] {
+            crate::state::create_pending_question(
+                &conn,
+                id,
+                "sess-fork",
+                "q",
+                &["甲".to_string(), "乙".to_string()],
+                false,
+                1000,
+                9_000_000,
+            )
+            .expect("create");
+            crate::state::set_question_batch(&conn, id, "toolu-f", seq, 2).expect("batch");
+            crate::state::mark_question_native_attach(&conn, id).expect("native");
+        }
+        crate::state::mark_question_delivered(&conn, "fs0", 1500).expect("delivered");
+        crate::state::mark_batch_submitted(&conn, "toolu-f", "sess-fork", 1600).expect("submitted");
+        // An attach would fail loudly here (no stub): the guard must come first.
+        std::env::remove_var("TINYCTB_TEST_ATTACH");
+        let (toast, outcome, retryable) =
+            inject_native_attach_answer(&conn, "fs1", "乙", 2000).expect("tap");
+        assert_eq!(toast, BATCH_HANDED_OFF);
+        assert_eq!(outcome, ApprovalAnswer::Delivered);
+        assert!(!retryable);
+        let (toast, _) = submit_question_batch(&conn, "fs1", 2100).expect("submit again");
+        assert_eq!(toast, BATCH_HANDED_OFF);
+    }
+
+    /// v0.2.20 (Astra r3): a fork multi-select tab whose dialog cannot be
+    /// reached gives its claim back — row open, batch not handed off — and a
+    /// handed-off batch refuses「提交这题」before looking at any ticks.
+    #[test]
+    fn a_fork_checked_tab_claim_is_released_when_nothing_was_typed() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = ["奶酪".to_string(), "火腿".to_string()];
+        for (id, seq) in [("fc0", 0usize), ("fc1", 1)] {
+            crate::state::create_pending_question(
+                &conn,
+                id,
+                "sess-fork",
+                "配料？",
+                &options,
+                true,
+                1000,
+                9_000_000,
+            )
+            .expect("create");
+            crate::state::set_question_batch(&conn, id, "toolu-fc", seq, 2).expect("batch");
+            crate::state::mark_question_native_attach(&conn, id).expect("native");
+        }
+        crate::state::set_checked_options(&conn, "fc0", &[1]).expect("tick");
+        // No attach stub: the dialog is unreachable, nothing is typed.
+        std::env::set_var("TINYCTB_TEST_ATTACH", "/nonexistent/attach");
+        let (toast, retryable) = submit_checked(&conn, "fc0", 2000).expect("submit");
+        std::env::remove_var("TINYCTB_TEST_ATTACH");
+        assert!(toast.starts_with("没能连上对话框"), "{toast}");
+        assert!(retryable);
+        assert_eq!(
+            crate::state::pending_question_status(&conn, "fc0", 2500).expect("status"),
+            crate::state::QuestionStatus::Open
+        );
+        assert!(!crate::state::batch_submitted(&conn, "fc1").expect("not handed off"));
+
+        // Handed off (e.g. another tab partly typed): refused first, even
+        // with nothing ticked on this tab.
+        crate::state::mark_batch_submitted(&conn, "toolu-fc", "sess-fork", 3000).expect("handoff");
+        let (toast, retryable) = submit_checked(&conn, "fc1", 3100).expect("refused");
+        assert_eq!(toast, BATCH_HANDED_OFF);
+        assert!(!retryable);
+    }
+
+    /// v0.2.20 (Astra r1): a batch pass cut short (a PC key, a timeout) is
+    /// reported honestly — not "submitted" — and nothing is retyped.
+    #[test]
+    fn a_cut_short_batch_pass_is_not_reported_as_submitted() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        seed_interactive_batch(&conn, &[("qc0", 0), ("qc1", 1)], 2);
+        std::env::set_var("TINYCTB_TEST_XTEST", "batch-partial");
+        inject_native_attach_answer(&conn, "qc0", "甲", 2000).expect("tap 1");
+        let (toast, _, retryable) =
+            inject_native_attach_answer(&conn, "qc1", "乙", 2100).expect("tap 2");
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+        // Cut short with keys possibly in: not "submitted", and — the fence's
+        // verdict being unknown — the PC's (电脑优先, Sol r9).
+        assert_eq!(toast, format!("已记下第 2/2 问：乙；{PC_WON}"));
+        assert!(!retryable);
+        assert!(crate::state::batch_pc_won(&conn, "qc0").expect("won"));
+        let (again, _) = submit_question_batch(&conn, "qc0", 2200).expect("again");
+        assert_eq!(again, BATCH_HANDED_OFF, "never retyped");
+    }
+
+    /// v0.2.20: an interactive batch with a multi-select tab — its ticks are
+    /// staged by「提交这题」, and the batch pass toggles each ticked box on
+    /// that tab before moving on.
+    #[test]
+    fn an_interactive_batch_types_a_multi_select_tab_as_toggles() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = ["奶酪".to_string(), "火腿".to_string(), "橄榄".to_string()];
+        crate::state::create_pending_question(
+            &conn,
+            "qx0",
+            "sess-win",
+            "配料？",
+            &options,
+            true,
+            1000,
+            9_000_000,
+        )
+        .expect("create");
+        crate::state::set_question_batch(&conn, "qx0", "toolu-x", 0, 2).expect("batch");
+        crate::state::mark_question_xtest_window(&conn, "qx0", 0x2a526d7, &test_terminal())
+            .expect("mark");
+        crate::approvals::checkbox_buttons(&conn, "999", "sess-win", "qx0", &options, 1000)
+            .expect("buttons");
+        seed_interactive_batch(&conn, &[("qx1", 1)], 2);
+        crate::state::set_question_batch(&conn, "qx1", "toolu-x", 1, 2).expect("same batch");
+        std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
+        let _ = take_xtest_steps();
+
+        for label in ["橄榄", "奶酪"] {
+            record_callback_answer(&conn, &checkbox_route(&conn, "qx0", Some(label)), 2000)
+                .expect("tick");
+        }
+        let staged = record_callback_answer(&conn, &checkbox_route(&conn, "qx0", None), 2100)
+            .expect("submit tab");
+        assert_eq!(
+            staged["toast"],
+            "已记下第 1/2 问：奶酪, 橄榄（已答 1/2 题）。全部答完会自动提交，或点「提交已答的」。"
+        );
+        assert!(take_xtest_steps().is_empty());
+
+        inject_native_attach_answer(&conn, "qx1", "乙", 2200).expect("tap");
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+        assert!(
+            take_xtest_steps().contains(&"batch 44377815 tinyctb-mark L,L,1,3,R,2,R".to_string()),
+            "toggle 1 and 3 on the multi-select tab, → on, option 2 on the next"
         );
     }
 

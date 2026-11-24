@@ -49,6 +49,12 @@ const TELEGRAM_WINDOWLESS_QUESTION_HINT: &str =
 /// A tab of a multi-question call the phone cannot drive (multi-select, free
 /// text, or an interactive session's own dialog): no buttons, and replying
 /// here would not answer it either.
+/// The「提交已答的」message under a multi-question batch (v0.2.20), and the
+/// 「还没答完」reminder: one button; a reply to it is not an answer.
+const TELEGRAM_BATCH_SUBMIT_HINT: &str = "👆 点按钮只提交已答的题（回复本消息不会作为答案）。";
+/// A multi-select question with phone checkboxes (v0.2.20).
+const TELEGRAM_CHECKBOX_HINT: &str =
+    "☑️ 多选题：点选项勾选或取消，选好后点「提交这题」。也可以直接回复字母，如 A,C。";
 const TELEGRAM_NOTIFY_ONLY_QUESTION_HINT: &str =
     "🖥️ 这一题手机答不了，请到电脑的对话框里作答（回复本消息不会作为答案）。";
 /// Neither confirmed: the session has no verified live socket, or reading it
@@ -146,6 +152,12 @@ fn telegram_event_reply_hint(event_type: &str, event: &Value) -> &'static str {
                 }
             }
         };
+    }
+    if event.get("batchSubmit").and_then(Value::as_bool) == Some(true) {
+        return TELEGRAM_BATCH_SUBMIT_HINT;
+    }
+    if event.get("checkboxes").and_then(Value::as_bool) == Some(true) {
+        return TELEGRAM_CHECKBOX_HINT;
     }
     if event.get("notifyOnly").and_then(Value::as_bool) == Some(true) {
         return TELEGRAM_NOTIFY_ONLY_QUESTION_HINT;
@@ -427,6 +439,8 @@ pub(crate) fn prepare_telegram_delivery(
         let mut rows: Vec<Value> = Vec::new();
         let mut current_row: Vec<Value> = Vec::new();
         let mut current_width = 0usize;
+        // Checkboxes read as a list: one per row, the submit button last.
+        let one_per_row = event.get("checkboxes").and_then(Value::as_bool) == Some(true);
         for button in &buttons {
             let (Some(text), Some(callback_id)) = (
                 button.get("text").and_then(Value::as_str),
@@ -436,7 +450,8 @@ pub(crate) fn prepare_telegram_delivery(
             };
             let width = display_width(text);
             if !current_row.is_empty()
-                && (current_row.len() >= MAX_BUTTONS_PER_ROW
+                && (one_per_row
+                    || current_row.len() >= MAX_BUTTONS_PER_ROW
                     || current_width + width > BUTTON_ROW_WIDTH_BUDGET)
             {
                 rows.push(json!(std::mem::take(&mut current_row)));
@@ -464,6 +479,7 @@ pub(crate) fn prepare_telegram_delivery(
                         .map(str::to_string),
                     question_id: event
                         .get("questionId")
+                        .or_else(|| event.get("batchQuestionId"))
                         .and_then(Value::as_str)
                         .map(str::to_string),
                     answer: button
@@ -504,7 +520,9 @@ pub(crate) fn prepare_telegram_delivery(
             .get("approvalId")
             .and_then(Value::as_str)
             .map(str::to_string),
-        notify_only: event.get("notifyOnly").and_then(Value::as_bool) == Some(true),
+        // The submit message routes no reply either: it answers no tab.
+        notify_only: event.get("notifyOnly").and_then(Value::as_bool) == Some(true)
+            || event.get("batchSubmit").and_then(Value::as_bool) == Some(true),
     })
 }
 
@@ -999,6 +1017,67 @@ mod tests {
         assert!(text.contains(full_message));
         assert!(text
             .contains("💬 To continue this session, use Telegram's Reply action on this message."));
+    }
+
+    /// v0.2.20: a multi-select question's checkboxes read as a list — one
+    /// per row, the submit button last — under the checkbox hint.
+    #[test]
+    fn checkboxes_render_one_per_row_with_their_hint() {
+        let event = json!({
+            "type": "question_request",
+            "threadId": "thr_w",
+            "questionId": "qm",
+            "checkboxes": true,
+            "lastPreview": "配料？",
+            "buttons": [
+                {"text": "⬜ A 奶酪", "callbackId": "t1", "action": "toggle_option", "answer": "奶酪"},
+                {"text": "⬜ B 火腿", "callbackId": "t2", "action": "toggle_option", "answer": "火腿"},
+                {"text": "📨 提交这题", "callbackId": "t3", "action": "submit_checked"}
+            ]
+        });
+        let prepared = prepare_telegram_delivery("999", &event).expect("prepared");
+        let rows = prepared.payloads[0]["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .expect("rows")
+            .clone();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2][0]["text"], "📨 提交这题");
+        assert_eq!(prepared.callback_routes.len(), 3);
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert!(text.contains("点选项勾选或取消"), "{text}");
+    }
+
+    /// v0.2.20: the「提交已答的」message carries one button routed to its
+    /// batch's anchor row, answers no tab (no questionId, no reply route) and
+    /// says so.
+    #[test]
+    fn a_batch_submit_message_routes_its_button_and_takes_no_reply() {
+        let event = json!({
+            "type": "question_request",
+            "threadId": "thr_w",
+            "batchSubmit": true,
+            "batchQuestionId": "qanchor",
+            "lastPreview": "【共 3 问】",
+            "buttons": [{"text": "📨 提交已答的", "callbackId": "s1", "action": "submit_question_batch"}]
+        });
+        let prepared = prepare_telegram_delivery("999", &event).expect("prepared");
+        assert_eq!(prepared.callback_routes.len(), 1);
+        assert_eq!(
+            prepared.callback_routes[0].question_id.as_deref(),
+            Some("qanchor")
+        );
+        assert_eq!(
+            prepared.callback_routes[0].action,
+            crate::state::TelegramCallbackAction::SubmitQuestionBatch
+        );
+        assert_eq!(prepared.question_id, None);
+        assert!(prepared.notify_only);
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert!(text.contains("只提交已答的题"), "{text}");
+        assert_eq!(
+            prepared.payloads[0]["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            "claude:s1"
+        );
     }
 
     /// A gate on a background session pushes a question no terminal can

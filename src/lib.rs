@@ -766,6 +766,7 @@ const RESET_RUNTIME_FILES: &[&str] = &[
     approvals::PRESENCE_STATE_FILE,
     approvals::PRESENCE_LOCK_FILE,
     daemon::INPUT_ACTIVITY_FILE,
+    daemon::INPUT_LISTENER_FILE,
 ];
 
 fn reset_result(dry_run: bool) -> Result<Value> {
@@ -896,7 +897,9 @@ fn reset_result(dry_run: bool) -> Result<Value> {
             format!("failed to read state dir entry in {}", state_dir.display())
         })?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let staged = (name.starts_with(".presence-probe.") || name.starts_with(".input-activity."))
+        let staged = (name.starts_with(".presence-probe.")
+            || name.starts_with(".input-activity.")
+            || name.starts_with(".input-listener."))
             && name.ends_with(".tmp");
         if !staged {
             continue;

@@ -195,6 +195,14 @@ pub(crate) struct TelegramCallbackRoute {
 pub(crate) enum TelegramCallbackAction {
     /// One option of a question the session is blocked on.
     AnswerQuestion,
+    /// Submit a multi-question batch with the tabs answered so far
+    /// (「提交已答的」); `question_id` is any row of the batch.
+    SubmitQuestionBatch,
+    /// Tick / untick one checkbox of a multi-select question (`answer` = the
+    /// option's label). Never consumed: the box can be tapped again.
+    ToggleOption,
+    /// Submit a multi-select question's ticked checkboxes.
+    SubmitChecked,
     Approve,
     /// Approve and stop asking for this tool in this session.
     ApproveSession,
@@ -205,6 +213,9 @@ impl TelegramCallbackAction {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::AnswerQuestion => "answer_question",
+            Self::SubmitQuestionBatch => "submit_question_batch",
+            Self::ToggleOption => "toggle_option",
+            Self::SubmitChecked => "submit_checked",
             Self::Approve => "approve",
             Self::ApproveSession => "approve_session",
             Self::Deny => "deny",
@@ -214,6 +225,9 @@ impl TelegramCallbackAction {
     pub(crate) fn from_str(value: &str) -> Option<Self> {
         match value {
             "answer_question" => Some(Self::AnswerQuestion),
+            "submit_question_batch" => Some(Self::SubmitQuestionBatch),
+            "toggle_option" => Some(Self::ToggleOption),
+            "submit_checked" => Some(Self::SubmitChecked),
             "approve" => Some(Self::Approve),
             "approve_session" => Some(Self::ApproveSession),
             "deny" => Some(Self::Deny),
@@ -953,6 +967,33 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "pending_questions", "inject_pid", "INTEGER")?;
     ensure_column(conn, "pending_questions", "inject_pid_start", "TEXT")?;
     ensure_column(conn, "pending_questions", "inject_tty", "TEXT")?;
+    // v0.2.20, multi-question batches answered from the phone:
+    // - `staged_answer`: an INTERACTIVE session's tab answered on the phone but
+    //   not typed yet. Its terminal cannot be read, so tabs are not typed one
+    //   by one: the whole batch is typed in ONE pass (navigate, digits, Submit)
+    //   once every tab is staged or the「提交已答的」button is tapped.
+    // - `tapped_at`: when the phone last answered this tab (staged, or typed
+    //   into a fork's tab) — the clock of the「还没答完」reminder.
+    // - `submitted_at`: the batch's Submit was pressed (or its typing pass
+    //   started); no reminder after that.
+    // - `reminded_at`: when the last reminder for the batch went out (stamped
+    //   on every row of the batch).
+    ensure_column(conn, "pending_questions", "staged_answer", "TEXT")?;
+    ensure_column(conn, "pending_questions", "tapped_at", "INTEGER")?;
+    ensure_column(conn, "pending_questions", "submitted_at", "INTEGER")?;
+    ensure_column(conn, "pending_questions", "reminded_at", "INTEGER")?;
+    // A multi-select question answered with phone checkboxes (v0.2.20): the
+    // 0-based option indexes ticked so far (JSON array, ascending). Nothing
+    // is answered until its「提交」button is tapped.
+    ensure_column(conn, "pending_questions", "checked_json", "TEXT")?;
+    // The user's 电脑优先 rule (v0.2.20): the PC keyboard touched a batch
+    // the phone would have to TOGGLE (multi-select) — the PC has the answer,
+    // every phone answer to the batch is void from then on.
+    ensure_column(conn, "pending_questions", "pc_won_at", "INTEGER")?;
+    // The phone is typing into a fork's batch right now (a stamp, cleared when
+    // the injection returns): a PostToolUse or sweep in that window must not
+    // read the batch as answered at the PC (Sol r10).
+    ensure_column(conn, "pending_questions", "phone_typing_at", "INTEGER")?;
     ensure_column(conn, "pending_prompts", "transcript_bytes", "INTEGER")?;
     ensure_column(conn, "pending_prompts", "notification_type", "TEXT")?;
     // WHICH INSTANCE of a prompt this row is. The id is `notify:{received_at}`
@@ -4101,6 +4142,8 @@ pub(crate) struct QuestionPrompt {
     /// finds the session's window by a title mark. `None` on a row that
     /// predates it (or a fork's attach row).
     pub(crate) inject_terminal: Option<crate::claude::SessionTerminal>,
+    /// A multi-select question (answered with checkboxes on the phone).
+    pub(crate) multi_select: bool,
 }
 
 pub(crate) fn question_prompt(
@@ -4148,6 +4191,17 @@ pub(crate) fn question_prompt(
             },
         )
         .optional()?;
+    let multi_select = row.is_some()
+        && conn
+            .query_row(
+                "SELECT multi_select FROM pending_questions WHERE question_id = ?1",
+                params![question_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten()
+            .unwrap_or(0)
+            != 0;
     Ok(row.map(
         |(
             thread_id,
@@ -4176,9 +4230,702 @@ pub(crate) fn question_prompt(
                 },
                 inject_window,
                 inject_terminal,
+                multi_select,
             }
         },
     ))
+}
+
+/// One row (tab) of a multi-question batch, as the batch-wide operations
+/// (staging, the one-pass typing, Submit, the reminder) see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchTab {
+    pub(crate) question_id: String,
+    pub(crate) seq: usize,
+    pub(crate) options: Vec<String>,
+    pub(crate) staged_answer: Option<String>,
+    pub(crate) delivered: bool,
+    pub(crate) answered: bool,
+    pub(crate) multi_select: bool,
+    /// A multi-select tab's ticked boxes (see `checked_json`).
+    pub(crate) checked: Vec<usize>,
+}
+
+/// A multi-question batch, found from any one of its rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchRows {
+    pub(crate) batch_id: String,
+    pub(crate) thread_id: String,
+    /// Tabs in the native dialog — including tabs the phone cannot drive,
+    /// which have no row.
+    pub(crate) total: usize,
+    /// The rows, in tab order.
+    pub(crate) tabs: Vec<BatchTab>,
+    /// Expired by its deadline (any row past `expires_at`).
+    pub(crate) expired: bool,
+    pub(crate) submitted: bool,
+    pub(crate) inject_window: Option<i64>,
+    pub(crate) inject_terminal: Option<crate::claude::SessionTerminal>,
+    /// When the batch was asked (its rows' creation time) — 电脑优先 counts PC
+    /// keys from here: the dialog is on the PC screen from that moment, so
+    /// any key after it may have landed in the dialog (user's choice after
+    /// Sol r13, 2026-11-24).
+    pub(crate) created_at: u64,
+}
+
+impl BatchRows {
+    /// Still waiting on the phone: nothing answered, not expired, not submitted.
+    pub(crate) fn live(&self) -> bool {
+        !self.expired && !self.submitted && self.tabs.iter().all(|t| !t.answered)
+    }
+}
+
+/// The batch that `question_id` belongs to; `None` for a row that is not one
+/// tab of a multi-question call (or no row at all).
+pub(crate) fn batch_rows(
+    conn: &Connection,
+    question_id: &str,
+    now: u64,
+) -> Result<Option<BatchRows>> {
+    let key: Option<(Option<String>, String)> = conn
+        .query_row(
+            "SELECT batch_id, thread_id FROM pending_questions WHERE question_id = ?1",
+            params![question_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((Some(batch_id), thread_id)) = key else {
+        return Ok(None);
+    };
+    let mut stmt = conn.prepare(
+        "SELECT question_id, batch_seq, batch_total, options_json, staged_answer,
+                delivered_at, answer, expires_at, submitted_at, inject_window,
+                inject_pid, inject_pid_start, inject_tty, multi_select, checked_json,
+                created_at
+         FROM pending_questions
+         WHERE batch_id = ?1 AND thread_id = ?2
+         ORDER BY batch_seq ASC",
+    )?;
+    let mut batch = BatchRows {
+        batch_id: batch_id.clone(),
+        thread_id: thread_id.clone(),
+        total: 0,
+        tabs: Vec::new(),
+        expired: false,
+        submitted: false,
+        inject_window: None,
+        inject_terminal: None,
+        created_at: 0,
+    };
+    let now_ms = timestamp_to_millis(now);
+    let mut rows = stmt.query(params![batch_id, thread_id])?;
+    while let Some(row) = rows.next()? {
+        let seq: Option<i64> = row.get(1)?;
+        let total: Option<i64> = row.get(2)?;
+        let options_json: String = row.get(3)?;
+        let answer: Option<String> = row.get(6)?;
+        let expires_at: i64 = row.get(7)?;
+        let submitted_at: Option<i64> = row.get(8)?;
+        let pid: Option<i64> = row.get(10)?;
+        let start: Option<String> = row.get(11)?;
+        let tty: Option<String> = row.get(12)?;
+        let (Some(seq), Some(total)) = (seq, total) else {
+            continue;
+        };
+        if seq < 0 || total <= 1 || seq >= total {
+            continue;
+        }
+        batch.total = batch.total.max(total as usize);
+        let created = from_sql_i64(row.get::<_, i64>(15)?)?;
+        if batch.created_at == 0 || created < batch.created_at {
+            batch.created_at = created;
+        }
+        if answer.as_deref() == Some(QUESTION_EXPIRED)
+            || now_ms > timestamp_to_millis(from_sql_i64(expires_at)?)
+        {
+            batch.expired = true;
+        }
+        batch.submitted |= submitted_at.is_some();
+        if batch.inject_window.is_none() {
+            batch.inject_window = row.get(9)?;
+        }
+        if batch.inject_terminal.is_none() {
+            if let (Some(pid), Some(start), Some(tty)) =
+                (pid.and_then(|p| u32::try_from(p).ok()), start, tty)
+            {
+                batch.inject_terminal = Some(crate::claude::SessionTerminal {
+                    pid,
+                    start,
+                    tty: std::path::PathBuf::from(tty),
+                });
+            }
+        }
+        batch.tabs.push(BatchTab {
+            question_id: row.get(0)?,
+            seq: seq as usize,
+            options: serde_json::from_str::<Vec<String>>(&options_json).unwrap_or_default(),
+            staged_answer: row.get(4)?,
+            delivered: row.get::<_, Option<i64>>(5)?.is_some(),
+            // The deadline's `QUESTION_EXPIRED` marker is not an answer (Sol
+            // r14): such a batch reads as EXPIRED, never as "已经提交过".
+            answered: answer.as_deref().is_some_and(|a| a != QUESTION_EXPIRED),
+            multi_select: row.get::<_, Option<i64>>(13)?.unwrap_or(0) != 0,
+            checked: row
+                .get::<_, Option<String>>(14)?
+                .and_then(|raw| serde_json::from_str::<Vec<usize>>(&raw).ok())
+                .unwrap_or_default(),
+        });
+    }
+    if batch.tabs.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(batch))
+}
+
+/// Stage the phone's answer for an INTERACTIVE batch tab (not typed yet). A
+/// later tap on another option of the same tab replaces it, until the batch's
+/// typing pass claims the rows. `false` when the row is no longer open.
+pub(crate) fn stage_batch_answer(
+    conn: &Connection,
+    question_id: &str,
+    answer: &str,
+    now: u64,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE pending_questions SET staged_answer = ?2, tapped_at = ?3
+         WHERE question_id = ?1 AND answer IS NULL AND delivered_at IS NULL
+           AND submitted_at IS NULL",
+        params![question_id, answer, to_sql_i64(now)?],
+    )?;
+    Ok(changed == 1)
+}
+
+/// The phone answered this tab (a fork tab whose digit was just typed): the
+/// reminder clock restarts.
+pub(crate) fn mark_question_tapped(conn: &Connection, question_id: &str, now: u64) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_questions SET tapped_at = ?2 WHERE question_id = ?1",
+        params![question_id, to_sql_i64(now)?],
+    )?;
+    Ok(())
+}
+
+/// Atomically CLAIM an interactive batch's typing pass BEFORE any key: every
+/// row of the batch must still be unanswered, unclaimed and unsubmitted, and
+/// all of them are stamped `delivered_at` + `submitted_at` in one statement.
+/// Two racing taps (or a tap racing the auto-submit) cannot both win.
+pub(crate) fn claim_batch_delivery(
+    conn: &Connection,
+    batch_id: &str,
+    thread_id: &str,
+    expected_rows: usize,
+    now: u64,
+) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let open: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pending_questions
+         WHERE batch_id = ?1 AND thread_id = ?2
+           AND answer IS NULL AND delivered_at IS NULL AND submitted_at IS NULL",
+        params![batch_id, thread_id],
+        |row| row.get(0),
+    )?;
+    if open as usize != expected_rows || expected_rows == 0 {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE pending_questions SET delivered_at = ?3, submitted_at = ?3
+         WHERE batch_id = ?1 AND thread_id = ?2",
+        params![batch_id, thread_id, to_sql_i64(now)?],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Undo [`claim_batch_delivery`] when NO key was sent. Never reopens an
+/// answered row.
+pub(crate) fn release_batch_delivery(
+    conn: &Connection,
+    batch_id: &str,
+    thread_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_questions SET delivered_at = NULL, submitted_at = NULL
+         WHERE batch_id = ?1 AND thread_id = ?2 AND answer IS NULL",
+        params![batch_id, thread_id],
+    )?;
+    Ok(())
+}
+
+/// The batch's Submit was pressed (a fork's auto-submit or「提交已答的」):
+/// no more reminders for it. Idempotent.
+pub(crate) fn mark_batch_submitted(
+    conn: &Connection,
+    batch_id: &str,
+    thread_id: &str,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_questions SET submitted_at = ?3
+         WHERE batch_id = ?1 AND thread_id = ?2 AND submitted_at IS NULL",
+        params![batch_id, thread_id, to_sql_i64(now)?],
+    )?;
+    Ok(())
+}
+
+/// A batch the phone started answering and then left: answered at least once,
+/// the last answer at least `quiet_ms` ago, not every tab answered yet, not
+/// submitted, nothing answered by the session, not expired — and not reminded
+/// since that last answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DueBatchReminder {
+    pub(crate) batch_id: String,
+    pub(crate) thread_id: String,
+    /// Any row of the batch — what the reminder's submit button routes to.
+    pub(crate) anchor_question_id: String,
+    pub(crate) total: usize,
+    /// 0-based tab indexes of the phone-answerable tabs still unanswered.
+    pub(crate) missing: Vec<usize>,
+    /// 0-based tab indexes only the PC can answer (no row) — the batch is
+    /// not complete while they exist, even with every phone tab answered.
+    pub(crate) pc_only: Vec<usize>,
+    /// When the batch was asked.
+    pub(crate) created_at: u64,
+    pub(crate) answered: usize,
+}
+
+pub(crate) fn due_batch_reminders(
+    conn: &Connection,
+    now: u64,
+    quiet_ms: u64,
+) -> Result<Vec<DueBatchReminder>> {
+    let now_sql = to_sql_i64(now)?;
+    let quiet_before = to_sql_i64(now.saturating_sub(quiet_ms))?;
+    let mut stmt = conn.prepare(
+        "SELECT batch_id, thread_id
+         FROM pending_questions
+         WHERE batch_id IS NOT NULL
+         GROUP BY batch_id, thread_id
+         HAVING MAX(tapped_at) IS NOT NULL
+            AND MAX(tapped_at) <= ?2
+            AND MAX(submitted_at) IS NULL
+            AND MAX(answer) IS NULL
+            AND MIN(expires_at) >= ?1
+            AND (MAX(reminded_at) IS NULL OR MAX(reminded_at) < MAX(tapped_at))",
+    )?;
+    let keys = stmt
+        .query_map(params![now_sql, quiet_before], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut due = Vec::new();
+    for (batch_id, thread_id) in keys {
+        let mut stmt = conn.prepare(
+            "SELECT question_id, batch_seq, batch_total, staged_answer, delivered_at, inject_window
+             FROM pending_questions WHERE batch_id = ?1 AND thread_id = ?2
+             ORDER BY batch_seq ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![batch_id, thread_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let created_at = from_sql_i64(conn.query_row(
+            "SELECT COALESCE(MIN(created_at), 0)
+             FROM pending_questions WHERE batch_id = ?1 AND thread_id = ?2",
+            params![batch_id, thread_id],
+            |row| row.get::<_, i64>(0),
+        )?)?;
+        let Some(anchor) = rows.first().map(|r| r.0.clone()) else {
+            continue;
+        };
+        let total = rows.iter().filter_map(|r| r.2).max().unwrap_or(0).max(0) as usize;
+        // An interactive tab is answered once STAGED; a fork tab once its
+        // digit was typed (`delivered_at`).
+        let missing: Vec<usize> = rows
+            .iter()
+            .filter(|r| {
+                if r.5.is_some() {
+                    r.3.is_none()
+                } else {
+                    r.4.is_none()
+                }
+            })
+            .filter_map(|r| r.1.map(|s| s.max(0) as usize))
+            .collect();
+        let pc_only: Vec<usize> = (0..total)
+            .filter(|seq| rows.iter().all(|r| r.1 != Some(*seq as i64)))
+            .collect();
+        if missing.is_empty() && pc_only.is_empty() {
+            continue;
+        }
+        // Nothing answered any more (Sol r11): the only staged tab was a
+        // multi-select whose ticks changed afterwards, which un-stages it. A
+        // reminder would say「已答 0 题」and offer a submit button with
+        // nothing behind it; the next staged answer re-arms the reminder.
+        if missing.len() >= rows.len() {
+            continue;
+        }
+        due.push(DueBatchReminder {
+            created_at,
+            pc_only,
+            answered: rows.len() - missing.len(),
+            batch_id,
+            thread_id,
+            anchor_question_id: anchor,
+            total,
+            missing,
+        });
+    }
+    Ok(due)
+}
+
+/// The ticked checkboxes of a multi-select question (ascending indexes).
+pub(crate) fn checked_options(conn: &Connection, question_id: &str) -> Result<Vec<usize>> {
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT checked_json FROM pending_questions WHERE question_id = ?1",
+            params![question_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(raw
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Vec<usize>>(&raw).ok())
+        .unwrap_or_default())
+}
+
+/// Replace the ticked set (sorted, deduplicated) while the question is still
+/// open on the phone — not answered, not typed, not submitted. A tab that was
+/// already STAGED is un-staged: its new set needs its own「提交」again.
+/// `false` when the row no longer takes ticks.
+pub(crate) fn set_checked_options(
+    conn: &Connection,
+    question_id: &str,
+    checked: &[usize],
+) -> Result<bool> {
+    let mut checked = checked.to_vec();
+    checked.sort_unstable();
+    checked.dedup();
+    let changed = conn.execute(
+        "UPDATE pending_questions SET checked_json = ?2, staged_answer = NULL
+         WHERE question_id = ?1 AND answer IS NULL AND delivered_at IS NULL
+           AND submitted_at IS NULL",
+        params![question_id, serde_json::to_string(&checked)?],
+    )?;
+    Ok(changed == 1)
+}
+
+/// The checkbox buttons that share a message with `callback_id`'s button and
+/// answer the same question: `(callback_id, action, answer)` in creation order
+/// — what an edit of that message's keyboard redraws.
+pub(crate) fn sibling_question_routes(
+    conn: &Connection,
+    callback_id: &str,
+) -> Result<Vec<(String, String, Option<String>)>> {
+    let key: Option<(Option<i64>, Option<String>)> = conn
+        .query_row(
+            "SELECT message_id, question_id FROM telegram_callback_routes WHERE callback_id = ?1",
+            params![callback_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((message_id, Some(question_id))) = key else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn.prepare(
+        "SELECT callback_id, action, answer FROM telegram_callback_routes
+         WHERE question_id = ?1 AND message_id IS ?2
+           AND action IN ('toggle_option', 'submit_checked')
+         ORDER BY created_at ASC, rowid ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![question_id, message_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The newest sent checkbox message of a multi-select question: one of its
+/// `toggle_option` routes and the message it rides on (Sol r12: a typed
+/// reply redraws it).
+pub(crate) fn question_checkbox_route(
+    conn: &Connection,
+    question_id: &str,
+) -> Result<Option<(String, i64)>> {
+    Ok(conn
+        .query_row(
+            "SELECT callback_id, message_id FROM telegram_callback_routes
+             WHERE question_id = ?1 AND action = 'toggle_option' AND message_id IS NOT NULL
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![question_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+/// Has `question_id`'s batch been submitted (or handed to the PC)? `false`
+/// for a row outside any batch.
+pub(crate) fn batch_submitted(conn: &Connection, question_id: &str) -> Result<bool> {
+    let submitted: Option<i64> = conn.query_row(
+        "SELECT COUNT(*) FROM pending_questions AS s
+         JOIN pending_questions AS q
+           ON s.batch_id = q.batch_id AND s.thread_id = q.thread_id
+         WHERE q.question_id = ?1 AND q.batch_id IS NOT NULL
+           AND s.submitted_at IS NOT NULL",
+        params![question_id],
+        |row| row.get(0),
+    )?;
+    Ok(submitted.unwrap_or(0) > 0)
+}
+
+/// Durable claim of a fork's MULTI-SELECT tab before its first toggle
+/// (Astra r3). Toggles are not idempotent — retyping flips boxes back — so
+/// the claim is written BEFORE any key and is conservative on its own: in
+/// ONE transaction the row is stamped `delivered_at = stamp` (no re-tap may
+/// type) and the whole batch `submitted_at = stamp` where unset (handed to
+/// the PC). A crash at any point after leaves the batch handed off. Only a
+/// clean finish ([`finish_checked_tab`]) or a zero-key failure
+/// ([`release_checked_tab`]) undoes the parts carrying `stamp`. `false` when
+/// the row is not open or the batch is already submitted.
+pub(crate) fn claim_checked_tab(conn: &Connection, question_id: &str, stamp: u64) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let key: Option<(String, String)> = tx
+        .query_row(
+            "SELECT batch_id, thread_id FROM pending_questions
+             WHERE question_id = ?1 AND batch_id IS NOT NULL
+               AND answer IS NULL AND delivered_at IS NULL",
+            params![question_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((batch_id, thread_id)) = key else {
+        return Ok(false);
+    };
+    let submitted: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pending_questions
+         WHERE batch_id = ?1 AND thread_id = ?2 AND submitted_at IS NOT NULL",
+        params![batch_id, thread_id],
+        |row| row.get(0),
+    )?;
+    if submitted > 0 {
+        return Ok(false);
+    }
+    let stamp = to_sql_i64(stamp)?;
+    tx.execute(
+        "UPDATE pending_questions SET delivered_at = ?2 WHERE question_id = ?1",
+        params![question_id, stamp],
+    )?;
+    tx.execute(
+        "UPDATE pending_questions SET submitted_at = ?3
+         WHERE batch_id = ?1 AND thread_id = ?2 AND submitted_at IS NULL",
+        params![batch_id, thread_id, stamp],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Is the claim `stamp` on this row still standing (not answered, not
+/// superseded)? The injector's authorization while it holds the claim.
+pub(crate) fn checked_claim_live(conn: &Connection, question_id: &str, stamp: u64) -> Result<bool> {
+    let live: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pending_questions
+         WHERE question_id = ?1 AND answer IS NULL AND delivered_at = ?2",
+        params![question_id, to_sql_i64(stamp)?],
+        |row| row.get(0),
+    )?;
+    Ok(live == 1)
+}
+
+/// Every toggle went in: the batch is no longer handed off (unless something
+/// else submitted it meanwhile — only `stamp`'s mark is lifted). The row
+/// stays delivered. One transaction.
+pub(crate) fn finish_checked_tab(conn: &Connection, question_id: &str, stamp: u64) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let stamp = to_sql_i64(stamp)?;
+    tx.execute(
+        "UPDATE pending_questions SET submitted_at = NULL
+         WHERE submitted_at = ?2 AND (batch_id, thread_id) =
+               (SELECT batch_id, thread_id FROM pending_questions WHERE question_id = ?1)",
+        params![question_id, stamp],
+    )?;
+    tx.execute(
+        "UPDATE pending_questions SET tapped_at = ?2 WHERE question_id = ?1",
+        params![question_id, stamp],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// No key went out: undo `stamp`'s claim entirely (the row reopens, the
+/// batch is no longer handed off). Never reopens an answered row.
+pub(crate) fn release_checked_tab(conn: &Connection, question_id: &str, stamp: u64) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let stamp = to_sql_i64(stamp)?;
+    tx.execute(
+        "UPDATE pending_questions SET submitted_at = NULL
+         WHERE submitted_at = ?2 AND (batch_id, thread_id) =
+               (SELECT batch_id, thread_id FROM pending_questions WHERE question_id = ?1)",
+        params![question_id, stamp],
+    )?;
+    tx.execute(
+        "UPDATE pending_questions SET delivered_at = NULL
+         WHERE question_id = ?1 AND delivered_at = ?2 AND answer IS NULL",
+        params![question_id, stamp],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// 电脑已抢答: mark `question_id`'s whole batch as won by the PC — no phone
+/// answer counts any more (it is also handed off: `submitted_at`). Returns
+/// whether THIS call set it (so the notice goes out once).
+pub(crate) fn mark_batch_pc_won(conn: &Connection, question_id: &str, now: u64) -> Result<bool> {
+    let now = to_sql_i64(now)?;
+    let changed = conn.execute(
+        "UPDATE pending_questions SET pc_won_at = ?2,
+           submitted_at = COALESCE(submitted_at, ?2)
+         WHERE pc_won_at IS NULL AND (batch_id, thread_id) =
+               (SELECT batch_id, thread_id FROM pending_questions
+                WHERE question_id = ?1 AND batch_id IS NOT NULL)",
+        params![question_id, now],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Has the PC won `question_id`'s batch (电脑已抢答)?
+pub(crate) fn batch_pc_won(conn: &Connection, question_id: &str) -> Result<bool> {
+    let won: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pending_questions AS s
+         JOIN pending_questions AS q
+           ON s.batch_id = q.batch_id AND s.thread_id = q.thread_id
+         WHERE q.question_id = ?1 AND q.batch_id IS NOT NULL
+           AND s.pc_won_at IS NOT NULL",
+        params![question_id],
+        |row| row.get(0),
+    )?;
+    Ok(won > 0)
+}
+
+/// Batches still waiting on the phone — nothing answered, not submitted, not
+/// won by the PC, not expired: `(anchor question_id, thread_id, asked at)`.
+/// The daemon checks each against the PC keyboard (电脑优先), whether or not
+/// the phone ever touched it (Sol r9).
+pub(crate) fn live_batches(conn: &Connection, now: u64) -> Result<Vec<(String, String, u64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT MIN(question_id), thread_id, MIN(created_at)
+         FROM pending_questions
+         WHERE batch_id IS NOT NULL
+         GROUP BY batch_id, thread_id
+         HAVING MAX(answer) IS NULL AND MAX(submitted_at) IS NULL
+            AND MAX(pc_won_at) IS NULL AND MAX(phone_typing_at) IS NULL
+            AND MIN(expires_at) >= ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![to_sql_i64(now)?], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(id, thread, created)| Ok((id, thread, from_sql_i64(created)?)))
+        .collect()
+}
+
+/// The phone starts / stops typing into `question_id`'s batch (`stamp`
+/// identifies this injection; clearing only lifts its own mark).
+pub(crate) fn set_batch_phone_typing(
+    conn: &Connection,
+    question_id: &str,
+    stamp: u64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_questions SET phone_typing_at = ?2
+         WHERE (batch_id, thread_id) =
+               (SELECT batch_id, thread_id FROM pending_questions
+                WHERE question_id = ?1 AND batch_id IS NOT NULL)",
+        params![question_id, to_sql_i64(stamp)?],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn clear_batch_phone_typing(
+    conn: &Connection,
+    question_id: &str,
+    stamp: u64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_questions SET phone_typing_at = NULL
+         WHERE phone_typing_at = ?2 AND (batch_id, thread_id) =
+               (SELECT batch_id, thread_id FROM pending_questions
+                WHERE question_id = ?1 AND batch_id IS NOT NULL)",
+        params![question_id, to_sql_i64(stamp)?],
+    )?;
+    Ok(())
+}
+
+/// Daemon start: lift every phone-typing mark (Sol r11). Only the daemon
+/// injects, and it holds the single-instance lock, so a mark that survives a
+/// restart belongs to an injection that died with the old process — left in
+/// place it would hide the batch from the 电脑优先 sweep and PostToolUse
+/// forever. Returns how many rows were cleared.
+pub(crate) fn clear_stale_phone_typing(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE pending_questions SET phone_typing_at = NULL
+         WHERE phone_typing_at IS NOT NULL",
+        [],
+    )?)
+}
+
+/// Batches of `thread_id` the PC is answering if a PostToolUse arrives now:
+/// still waiting on the phone (nothing answered, not submitted from the
+/// phone, not typing from the phone, not already won, and not EXPIRED — a
+/// batch whose phone window closed is not one the phone lost, Sol r13).
+/// Anchor question ids.
+pub(crate) fn waiting_batches_for_thread(
+    conn: &Connection,
+    thread_id: &str,
+    now: u64,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT MIN(question_id)
+         FROM pending_questions
+         WHERE batch_id IS NOT NULL AND thread_id = ?1
+         GROUP BY batch_id
+         HAVING MAX(answer) IS NULL AND MAX(submitted_at) IS NULL
+            AND MAX(pc_won_at) IS NULL AND MAX(phone_typing_at) IS NULL
+            AND MIN(expires_at) >= ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![thread_id, to_sql_i64(now)?], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The reminder for this batch went out: no other until a new answer.
+pub(crate) fn mark_batch_reminded(
+    conn: &Connection,
+    batch_id: &str,
+    thread_id: &str,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_questions SET reminded_at = ?3 WHERE batch_id = ?1 AND thread_id = ?2",
+        params![batch_id, thread_id, to_sql_i64(now)?],
+    )?;
+    Ok(())
 }
 
 /// Same one-answer-only contract as approvals: the first answer wins, and an
@@ -5272,6 +6019,275 @@ mod tests {
     /// every such row pinned at the top of `/threads` for good — the very
     /// thing this release exists to fix, and unreachable if the fix only
     /// applies to rows that do not exist yet.
+    /// v0.2.20: a batch the phone started answering gets ONE「还没答完」
+    /// reminder after a minute's pause; a new answer re-arms it; a complete
+    /// or submitted batch gets none.
+    #[test]
+    fn a_paused_half_answered_batch_is_reminded_once_per_pause() {
+        let conn = create_state_db_in_memory().expect("db");
+        for (id, seq) in [("r0", 0usize), ("r1", 1), ("r2", 2)] {
+            create_pending_question(
+                &conn,
+                id,
+                "t",
+                "q",
+                &["a".into(), "b".into()],
+                false,
+                0,
+                10_000_000,
+            )
+            .expect("create");
+            set_question_batch(&conn, id, "b1", seq, 3).expect("batch");
+            mark_question_native_attach(&conn, id).expect("native");
+        }
+        let quiet = 60_000;
+        // Nothing answered yet: the pushes themselves are the prompt.
+        assert!(due_batch_reminders(&conn, 1_000_000, quiet)
+            .expect("due")
+            .is_empty());
+        // A fork tab typed at t=100s.
+        mark_question_delivered(&conn, "r1", 100_000).expect("delivered");
+        mark_question_tapped(&conn, "r1", 100_000).expect("tapped");
+        assert!(due_batch_reminders(&conn, 159_999, quiet)
+            .expect("due")
+            .is_empty());
+        let due = due_batch_reminders(&conn, 160_000, quiet).expect("due");
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].missing, vec![0, 2]);
+        assert_eq!((due[0].answered, due[0].total), (1, 3));
+        mark_batch_reminded(&conn, "b1", "t", 160_000).expect("reminded");
+        assert!(
+            due_batch_reminders(&conn, 400_000, quiet)
+                .expect("due")
+                .is_empty(),
+            "once per pause"
+        );
+        // Another answer re-arms it.
+        mark_question_delivered(&conn, "r0", 500_000).expect("delivered");
+        mark_question_tapped(&conn, "r0", 500_000).expect("tapped");
+        assert_eq!(
+            due_batch_reminders(&conn, 560_000, quiet).expect("due")[0].missing,
+            vec![2]
+        );
+        // Submitted: nothing more.
+        mark_batch_submitted(&conn, "b1", "t", 560_500).expect("submitted");
+        assert!(due_batch_reminders(&conn, 700_000, quiet)
+            .expect("due")
+            .is_empty());
+    }
+
+    /// v0.2.20 (Astra r3): a fork multi-select tab's claim delivers the row
+    /// AND hands the batch to the PC in one step; a clean finish lifts only
+    /// its own hand-off, a zero-key release undoes it all, and a claim never
+    /// overrides a batch someone else submitted.
+    #[test]
+    fn a_checked_tab_claim_hands_off_until_finished_or_released() {
+        let conn = create_state_db_in_memory().expect("db");
+        for (id, seq) in [("c0", 0usize), ("c1", 1)] {
+            create_pending_question(
+                &conn,
+                id,
+                "t",
+                "q",
+                &["a".into(), "b".into()],
+                true,
+                0,
+                10_000_000,
+            )
+            .expect("create");
+            set_question_batch(&conn, id, "bc", seq, 2).expect("batch");
+            mark_question_native_attach(&conn, id).expect("native");
+        }
+        assert!(claim_checked_tab(&conn, "c0", 5_000).expect("claim"));
+        assert!(
+            batch_submitted(&conn, "c1").expect("handed off"),
+            "a crash now leaves it handed off"
+        );
+        assert!(checked_claim_live(&conn, "c0", 5_000).expect("live"));
+        assert!(
+            !claim_checked_tab(&conn, "c1", 5_001).expect("second"),
+            "one claim at a time"
+        );
+        release_checked_tab(&conn, "c0", 5_000).expect("release");
+        assert!(!batch_submitted(&conn, "c1").expect("released"));
+        assert_eq!(
+            pending_question_status(&conn, "c0", 6_000).expect("status"),
+            QuestionStatus::Open
+        );
+
+        assert!(claim_checked_tab(&conn, "c0", 7_000).expect("claim again"));
+        finish_checked_tab(&conn, "c0", 7_000).expect("finish");
+        assert!(!batch_submitted(&conn, "c1").expect("finished"));
+        assert_eq!(
+            pending_question_status(&conn, "c0", 8_000).expect("status"),
+            QuestionStatus::Delivered
+        );
+
+        // A batch submitted by someone else is never claimed, and a finish
+        // never lifts a mark that is not its own.
+        mark_batch_submitted(&conn, "bc", "t", 9_000).expect("submitted");
+        assert!(!claim_checked_tab(&conn, "c1", 9_500).expect("refused"));
+        finish_checked_tab(&conn, "c0", 7_000).expect("finish again");
+        assert!(batch_submitted(&conn, "c1").expect("still submitted"));
+    }
+
+    /// Sol r5: a batch with a PC-only tab (no row) is still reminded when
+    /// every phone tab is answered — it is not complete — naming that tab.
+    #[test]
+    fn a_batch_with_a_pc_only_tab_is_still_reminded() {
+        let conn = create_state_db_in_memory().expect("db");
+        let terminal = crate::claude::SessionTerminal {
+            pid: 1,
+            start: "1".into(),
+            tty: std::path::PathBuf::from("/dev/pts/1"),
+        };
+        for (id, seq) in [("p0", 0usize), ("p2", 2)] {
+            create_pending_question(
+                &conn,
+                id,
+                "t",
+                "q",
+                &["a".into(), "b".into()],
+                false,
+                0,
+                10_000_000,
+            )
+            .expect("create");
+            set_question_batch(&conn, id, "bp", seq, 3).expect("batch");
+            mark_question_xtest_window(&conn, id, 7, &terminal).expect("xtest");
+        }
+        assert!(stage_batch_answer(&conn, "p0", "a", 1_000).expect("stage"));
+        assert!(stage_batch_answer(&conn, "p2", "b", 2_000).expect("stage"));
+        let due = due_batch_reminders(&conn, 62_000, 60_000).expect("due");
+        assert_eq!(due.len(), 1);
+        assert!(due[0].missing.is_empty());
+        assert_eq!(due[0].pc_only, vec![1]);
+    }
+
+    /// An interactive tab counts as answered once STAGED (nothing is typed
+    /// until the batch is submitted); a fully staged batch is not reminded.
+    #[test]
+    fn staged_interactive_tabs_count_as_answered_for_the_reminder() {
+        let conn = create_state_db_in_memory().expect("db");
+        let terminal = crate::claude::SessionTerminal {
+            pid: 1,
+            start: "1".into(),
+            tty: std::path::PathBuf::from("/dev/pts/1"),
+        };
+        for (id, seq) in [("s0", 0usize), ("s1", 1)] {
+            create_pending_question(
+                &conn,
+                id,
+                "t",
+                "q",
+                &["a".into(), "b".into()],
+                false,
+                0,
+                10_000_000,
+            )
+            .expect("create");
+            set_question_batch(&conn, id, "b2", seq, 2).expect("batch");
+            mark_question_xtest_window(&conn, id, 7, &terminal).expect("xtest");
+        }
+        assert!(stage_batch_answer(&conn, "s0", "a", 1_000).expect("stage"));
+        assert_eq!(
+            due_batch_reminders(&conn, 61_000, 60_000).expect("due")[0].missing,
+            vec![1]
+        );
+        assert!(stage_batch_answer(&conn, "s1", "b", 2_000).expect("stage"));
+        assert!(due_batch_reminders(&conn, 120_000, 60_000)
+            .expect("due")
+            .is_empty());
+        // Claimed for typing: staging is closed.
+        assert!(claim_batch_delivery(&conn, "b2", "t", 2, 3_000).expect("claim"));
+        assert!(!claim_batch_delivery(&conn, "b2", "t", 2, 3_000).expect("claim twice"));
+        assert!(!stage_batch_answer(&conn, "s0", "b", 4_000).expect("stage late"));
+    }
+
+    /// Sol r11: re-ticking the only staged (multi-select) tab un-stages it;
+    /// with nothing answered left, no「已答 0 题」reminder goes out — until
+    /// a tab is staged again.
+    #[test]
+    fn an_unstaged_batch_with_nothing_answered_is_not_reminded() {
+        let conn = create_state_db_in_memory().expect("db");
+        let terminal = crate::claude::SessionTerminal {
+            pid: 1,
+            start: "1".into(),
+            tty: std::path::PathBuf::from("/dev/pts/1"),
+        };
+        for (id, seq) in [("u0", 0usize), ("u1", 1)] {
+            create_pending_question(
+                &conn,
+                id,
+                "t",
+                "q",
+                &["a".into(), "b".into()],
+                seq == 0,
+                0,
+                10_000_000,
+            )
+            .expect("create");
+            set_question_batch(&conn, id, "bu", seq, 2).expect("batch");
+            mark_question_xtest_window(&conn, id, 7, &terminal).expect("xtest");
+        }
+        assert!(stage_batch_answer(&conn, "u0", "a", 1_000).expect("stage"));
+        assert_eq!(
+            due_batch_reminders(&conn, 61_000, 60_000)
+                .expect("due")
+                .len(),
+            1
+        );
+        assert!(set_checked_options(&conn, "u0", &[0, 1]).expect("re-tick"));
+        assert!(due_batch_reminders(&conn, 61_000, 60_000)
+            .expect("due")
+            .is_empty());
+        assert!(stage_batch_answer(&conn, "u0", "a, b", 2_000).expect("restage"));
+        assert_eq!(
+            due_batch_reminders(&conn, 62_000, 60_000)
+                .expect("due")
+                .len(),
+            1
+        );
+    }
+
+    /// Sol r13: a batch past its phone deadline is not "waiting" — a
+    /// PostToolUse after it must not declare it PC-won.
+    #[test]
+    fn an_expired_batch_is_not_waiting_for_the_phone() {
+        let conn = create_state_db_in_memory().expect("db");
+        create_pending_question(&conn, "e0", "t", "q", &["a".into()], false, 1_000, 5_000)
+            .expect("create");
+        set_question_batch(&conn, "e0", "be", 0, 2).expect("batch");
+        assert_eq!(
+            waiting_batches_for_thread(&conn, "t", 4_000).expect("w"),
+            vec!["e0".to_string()]
+        );
+        assert!(waiting_batches_for_thread(&conn, "t", 6_000)
+            .expect("w")
+            .is_empty());
+    }
+
+    /// Sol r11: a phone-typing mark that outlived its daemon is lifted at
+    /// start, so the batch is the 电脑优先 sweep's and PostToolUse's again.
+    #[test]
+    fn a_stale_phone_typing_mark_is_cleared_at_start() {
+        let conn = create_state_db_in_memory().expect("db");
+        create_pending_question(&conn, "w0", "t", "q", &["a".into()], false, 0, 10_000_000)
+            .expect("create");
+        set_question_batch(&conn, "w0", "bw", 0, 2).expect("batch");
+        set_batch_phone_typing(&conn, "w0", 5_000).expect("typing");
+        assert!(waiting_batches_for_thread(&conn, "t", 6_000)
+            .expect("w")
+            .is_empty());
+        assert!(live_batches(&conn, 6_000).expect("live").is_empty());
+        assert_eq!(clear_stale_phone_typing(&conn).expect("clear"), 1);
+        assert_eq!(
+            waiting_batches_for_thread(&conn, "t", 6_000).expect("w"),
+            vec!["w0".to_string()]
+        );
+        assert_eq!(live_batches(&conn, 6_000).expect("live").len(), 1);
+    }
+
     #[test]
     fn a_measurement_corrects_a_row_that_was_pushed_forward() {
         let conn = create_state_db_in_memory().expect("db");

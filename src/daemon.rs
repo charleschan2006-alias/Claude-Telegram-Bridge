@@ -1221,6 +1221,20 @@ fn daemon_cycle_lanes(
     // check can see anything the sync just enqueued for the same completion.
     let bridge_turns = process_bridge_turns(conn, config, now)
         .unwrap_or_else(|error| json!({ "ok": false, "error": format!("{error:#}") }));
+    // A half-answered multi-question batch left alone for a minute gets one
+    // 「还没答完」reminder (v0.2.20); queued before delivery so it goes out now.
+    if lanes.full_sync {
+        if let Err(error) = crate::approvals::enqueue_batch_reminders(conn, now) {
+            println!(
+                "{}",
+                json!({
+                    "ok": false,
+                    "action": "batch_reminder_error",
+                    "error": format!("{error:#}")
+                })
+            );
+        }
+    }
     // Delivery is not gated on away mode: enqueueing is the policy point.
     // While the user is present the outbox only ever holds answers to turns
     // they started from Telegram, which must always be delivered.
@@ -1239,6 +1253,67 @@ fn daemon_cycle_lanes(
 
 /// Where the keyboard listener records the last keypress it saw.
 pub(crate) const INPUT_ACTIVITY_FILE: &str = "input-activity.json";
+
+/// The keyboard listener's heartbeat (v0.2.20, Sol r6): rewritten every
+/// [`INPUT_LISTENER_HEARTBEAT`] while an `xinput` stream is connected, so a
+/// reader can tell "no key pressed" from "nobody was listening" — a stale
+/// `input-activity.json` left by a dead listener proves nothing.
+pub(crate) const INPUT_LISTENER_FILE: &str = "input-listener.json";
+const INPUT_LISTENER_HEARTBEAT: Duration = Duration::from_millis(250);
+
+/// The listener's stream, stamped with WHEN it last returned from a read:
+/// `busy` is 0 while the reader waits in a read (healthy idle), or the time
+/// the last read returned (processing). The heartbeat stops if processing
+/// has taken over a second — a reader stuck after a read would otherwise let
+/// the heartbeat vouch for keys nobody is publishing (Sol r8).
+struct BusyReader {
+    inner: Box<dyn std::io::BufRead + Send>,
+    busy: Arc<std::sync::atomic::AtomicU64>,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl std::io::Read for BusyReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.busy.store(0, Ordering::SeqCst);
+        let read = self.inner.read(buf);
+        self.busy.store((self.clock)().max(1), Ordering::SeqCst);
+        read
+    }
+}
+
+impl std::io::BufRead for BusyReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.busy.store(0, Ordering::SeqCst);
+        let now = (self.clock)().max(1);
+        let busy = Arc::clone(&self.busy);
+        let filled = self.inner.fill_buf();
+        busy.store(now.max((self.clock)()), Ordering::SeqCst);
+        filled
+    }
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt);
+    }
+}
+
+/// Write the heartbeat atomically (staged + rename), best-effort.
+/// `up_since_ms`: when this stream connected — a reader needs the listener
+/// to have been up for the WHOLE span it asks about.
+/// `idle`: the reader was waiting in a read when this beat was taken — every
+/// event the X server had delivered to the stream by then has been read and
+/// published (Sol r9: a reader may lag behind a key pressed just before a
+/// caller's own fence went up).
+fn write_listener_heartbeat(dir: &Path, now_ms: u64, up_since_ms: u64, idle: bool) {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let staged = dir.join(format!(".input-listener.{}.{seq}.tmp", std::process::id()));
+    let payload =
+        json!({ "aliveAtMs": now_ms, "upSinceMs": up_since_ms, "idle": idle }).to_string();
+    if std::fs::write(&staged, payload).is_err()
+        || std::fs::rename(&staged, dir.join(INPUT_LISTENER_FILE)).is_err()
+    {
+        let _ = std::fs::remove_file(&staged);
+    }
+}
 
 /// One write per this interval is plenty: the gates compare against a 15s
 /// window, and a burst of typing would otherwise rewrite the file per key.
@@ -1267,7 +1342,7 @@ type XStreamOpener = dyn Fn(&XCandidate) -> Option<XSession> + Send + Sync;
 /// itself would let N sessions write N times a second.
 #[derive(Default)]
 struct ActivityPublisher {
-    last_write: std::sync::Mutex<Option<Instant>>,
+    state: std::sync::Mutex<PublishState>,
     /// Test-only fault injection: pretend the write failed AFTER the staging
     /// file was created, which is the case that leaks — the name carries an
     /// ever-increasing sequence, so every failure would leave another
@@ -1277,17 +1352,43 @@ struct ActivityPublisher {
 }
 
 impl ActivityPublisher {
-    /// Publish if the shared gap has elapsed. Returns whether it wrote.
-    fn publish(&self, dir: &Path, now_ms: u64, min_gap: Duration) -> bool {
-        let mut last = self
-            .last_write
+    fn lock(&self) -> std::sync::MutexGuard<'_, PublishState> {
+        self.state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Publish if the shared gap has elapsed. Returns whether it wrote.
+    /// A key that falls inside the gap is not lost (Sol r11): it is kept as
+    /// `pending` and written by [`Self::flush_pending`] on the next listener
+    /// heartbeat, so the record always ends up holding the LATEST key's real
+    /// time — readers compare against it exactly, with no slack.
+    fn publish(&self, dir: &Path, now_ms: u64, min_gap: Duration) -> bool {
+        let mut state = self.lock();
+        let at = state.pending.map_or(now_ms, |pending| pending.max(now_ms));
         // Monotonic, never wall clock: a wall-clock comparison would refuse
         // to record real keypresses for as long as a backwards jump lasted.
-        if last.is_some_and(|at| at.elapsed() < min_gap) {
+        if state.last_write.is_some_and(|at| at.elapsed() < min_gap) {
+            state.pending = Some(at);
             return false;
         }
+        self.write_locked(&mut state, dir, at)
+    }
+
+    /// Write a key the throttle held back. Returns true when nothing is left
+    /// pending — only then may a heartbeat claim the listener is caught up.
+    fn flush_pending(&self, dir: &Path) -> bool {
+        let mut state = self.lock();
+        match state.pending {
+            None => true,
+            Some(at) => self.write_locked(&mut state, dir, at),
+        }
+    }
+
+    fn write_locked(&self, state: &mut PublishState, dir: &Path, now_ms: u64) -> bool {
+        // Until it is on disk, the key stays pending (a failed write is
+        // retried by the next heartbeat, never forgotten).
+        state.pending = Some(now_ms);
         // Unique staging name per write: same pid, many threads.
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1314,9 +1415,17 @@ impl ActivityPublisher {
             let _ = std::fs::remove_file(&staged);
             return false;
         }
-        *last = Some(Instant::now());
+        state.last_write = Some(Instant::now());
+        state.pending = None;
         true
     }
+}
+
+/// The publisher's throttle and the key it is holding back, under one lock.
+#[derive(Default)]
+struct PublishState {
+    last_write: Option<Instant>,
+    pending: Option<u64>,
 }
 
 /// Is this line a keypress at all?
@@ -1443,7 +1552,57 @@ fn spawn_worker(
                 // never visible to `cancel`, so reap it here and stop.
                 break;
             }
-            record_keypresses(session.reader, &dir, &publisher, min_gap, &|| clock());
+            // Heartbeat for as long as this stream is connected AND its
+            // reader is healthy (waiting in a read, or done processing within
+            // a second). Written under a lock that the disconnect takes too,
+            // so once the stream ends the heartbeat is REMOVED at once and
+            // can never be rewritten by a beat in flight — a reader must not
+            // see a dead listener as alive for the freshness window (Sol r8).
+            let connected = Arc::new(std::sync::Mutex::new(true));
+            let busy = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            {
+                let connected = Arc::clone(&connected);
+                let busy = Arc::clone(&busy);
+                let dir = dir.clone();
+                let clock = Arc::clone(&clock);
+                let publisher = Arc::clone(&publisher);
+                let up_since = clock();
+                std::thread::spawn(move || loop {
+                    {
+                        let live = connected.lock().unwrap_or_else(|p| p.into_inner());
+                        if !*live {
+                            break;
+                        }
+                        let now = clock();
+                        // Read `busy` BEFORE flushing: a reader seen waiting
+                        // has already handed every key it read to the
+                        // publisher, so the flush below covers them all and
+                        // an idle beat never runs ahead of the record.
+                        let processing = busy.load(Ordering::SeqCst);
+                        let caught_up = publisher.flush_pending(&dir);
+                        if processing == 0 || now.saturating_sub(processing) <= 1_000 {
+                            write_listener_heartbeat(
+                                &dir,
+                                now,
+                                up_since,
+                                processing == 0 && caught_up,
+                            );
+                        }
+                    }
+                    std::thread::sleep(INPUT_LISTENER_HEARTBEAT);
+                });
+            }
+            let reader = BusyReader {
+                inner: session.reader,
+                busy: Arc::clone(&busy),
+                clock: Arc::clone(&clock),
+            };
+            record_keypresses(reader, &dir, &publisher, min_gap, &|| clock());
+            {
+                let mut live = connected.lock().unwrap_or_else(|p| p.into_inner());
+                *live = false;
+                let _ = std::fs::remove_file(dir.join(INPUT_LISTENER_FILE));
+            }
             // EOF: the child is gone or going. Reap it — a forgotten child
             // becomes a zombie, once per reconnect.
             let child = lock_state(&thread_state).child.take();
@@ -1637,6 +1796,9 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
     let _daemon_lock = acquire_daemon_lock()?;
     let db_path = state_db_path()?;
     let conn = create_state_db(&db_path)?;
+    // Under the daemon lock no injection of ours can be running, so any
+    // phone-typing mark left behind is stale (Sol r11).
+    crate::state::clear_stale_phone_typing(&conn)?;
     let config = load_daemon_config()?;
     if once {
         let result = daemon_cycle(&conn, &config, now_millis()?, timeout)?;
@@ -5168,6 +5330,40 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(dir.join(INPUT_ACTIVITY_FILE)).expect("read"))
                 .expect("json");
         assert_eq!(value["lastInputAtMs"], 222);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Sol r11: a key inside the throttle gap is held, not dropped — the
+    /// heartbeat's flush writes its real time, and the record never claims
+    /// the listener caught up while one is still held.
+    #[test]
+    fn a_throttled_key_is_flushed_with_its_own_time() {
+        let dir = temp_dir("publish-pending");
+        let publisher = ActivityPublisher::default();
+        assert!(publisher.flush_pending(&dir), "nothing held yet");
+        assert!(publisher.publish(&dir, 1_000, Duration::from_secs(30)));
+        assert!(!publisher.publish(&dir, 1_400, Duration::from_secs(30)));
+        assert!(!publisher.publish(&dir, 1_300, Duration::from_secs(30)));
+        let read = || -> u64 {
+            serde_json::from_str::<Value>(
+                &fs::read_to_string(dir.join(INPUT_ACTIVITY_FILE)).expect("read"),
+            )
+            .expect("json")["lastInputAtMs"]
+                .as_u64()
+                .expect("ms")
+        };
+        assert_eq!(read(), 1_000, "the gap holds the later keys back");
+        assert!(publisher.flush_pending(&dir), "flushed");
+        assert_eq!(read(), 1_400, "the latest held key's own time");
+        assert!(publisher.flush_pending(&dir), "nothing left");
+        assert_eq!(read(), 1_400);
+        // A failed flush keeps the key held, and says so.
+        assert!(!publisher.publish(&dir, 2_000, Duration::from_secs(30)));
+        publisher.fail_after_create.store(true, Ordering::Relaxed);
+        assert!(!publisher.flush_pending(&dir), "still held after a failure");
+        publisher.fail_after_create.store(false, Ordering::Relaxed);
+        assert!(publisher.flush_pending(&dir));
+        assert_eq!(read(), 2_000);
         let _ = fs::remove_dir_all(&dir);
     }
 
