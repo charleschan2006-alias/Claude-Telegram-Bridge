@@ -1539,6 +1539,11 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
             crate::state::settle_stale_native_questions(&tx, &thread_id, &question_id, now)?;
         } else if let Some((window, terminal)) = &xtest_target {
             crate::state::mark_question_xtest_window(&tx, &question_id, *window, terminal)?;
+            // The key the stale-row settle below must KEEP: a one-tab batch's
+            // batch_id, else the question's own id. Keeping the bare id for a
+            // batched row settled the new question itself as "answered
+            // elsewhere" at once (v0.2.27 live test: the poll closed in 3s).
+            let mut keep_key = question_id.clone();
             if multi_select {
                 // A one-tab batch (see `xtest_target`).
                 let batch_id = match payload.get("tool_use_id").and_then(Value::as_str) {
@@ -1546,6 +1551,7 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
                     _ => format!("batch-{question_id}"),
                 };
                 crate::state::set_question_batch(&tx, &question_id, &batch_id, 0, 1)?;
+                keep_key = batch_id;
             }
             // An interactive session has AT MOST one live question at a time
             // (the tool blocks its own turn), so normally there is no stale
@@ -1554,7 +1560,7 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
             // button could XTEST an old option into THIS new question. Settle
             // any older open native row now — the same invariant the fork path
             // relies on — so a stale tap reads Answered and bails.
-            crate::state::settle_stale_native_questions(&tx, &thread_id, &question_id, now)?;
+            crate::state::settle_stale_native_questions(&tx, &thread_id, &keep_key, now)?;
         }
         tx.commit()?;
     }
@@ -5535,6 +5541,16 @@ mod tests {
         assert_eq!(window, Some(0x2a526d7));
         assert_eq!(batch.as_deref(), Some("toolu-multi-w"));
         assert_eq!((seq, total), (Some(0), Some(1)));
+        // Still OPEN for the phone: the stale-row settle must not take the
+        // new question itself (v0.2.27 live bug).
+        let answer: Option<String> = conn
+            .query_row(
+                "SELECT answer FROM pending_questions WHERE thread_id = 'sess-q'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("answer");
+        assert_eq!(answer, None, "the new question must stay open");
         let payload_json: String = conn
             .query_row(
                 "SELECT payload_json FROM outbound_events WHERE event_type = 'question_request'",
