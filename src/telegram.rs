@@ -10324,6 +10324,39 @@ mod tests {
         assert_eq!(texts, ["🔴A 同名", "✅B 同名"]);
     }
 
+    /// v0.2.27: a vote on an interactive single multi-select question (a
+    /// one-tab batch) types the ticks, `→` to Submit, and submits.
+    #[test]
+    fn a_vote_on_a_single_interactive_multi_select_types_it() {
+        let _guard = crate::state::test_env_lock();
+        let _untouched = crate::state::EnvVarGuard::set("TINYCTB_TEST_INPUT_SINCE", "untouched");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let options = ["奶酪".to_string(), "火腿".to_string(), "橄榄".to_string()];
+        crate::state::create_pending_question(
+            &conn,
+            "qo",
+            "sess-win",
+            "配料？",
+            &options,
+            true,
+            1000,
+            9_000_000,
+        )
+        .expect("create");
+        crate::state::set_question_batch(&conn, "qo", "toolu-o", 0, 1).expect("batch");
+        crate::state::mark_question_xtest_window(&conn, "qo", 0x2a526d7, &test_terminal())
+            .expect("mark");
+        std::env::set_var("TINYCTB_TEST_XTEST", "delivered");
+        let _ = take_xtest_steps();
+        let notice = record_poll_vote(&conn, "qo", &[0, 2], 2000).expect("vote");
+        std::env::remove_var("TINYCTB_TEST_XTEST");
+        assert!(notice.contains("送进电脑上的对话框"), "{notice}");
+        assert!(
+            take_xtest_steps().contains(&"batch 44377815 tinyctb-mark L,1,3,R,R".to_string()),
+            "toggle A and C, then → to Submit"
+        );
+    }
+
     fn take_xtest_steps() -> Vec<String> {
         crate::fork_dialog::XTEST_STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()))
     }

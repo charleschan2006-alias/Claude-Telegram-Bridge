@@ -1121,7 +1121,7 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
         }
         // The title says an approval waits (every round; the stack push
         // happens once).
-        banner.paint_approval();
+        banner.paint_approval(&tool_name);
         match wait_out_approval_window(
             &conn,
             kind,
@@ -1133,6 +1133,7 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
             now,
             &gate_clock,
             terminal_watch.as_mut(),
+            &|| banner.paint_approval(&tool_name),
         )? {
             WindowOutcome::Settled(value, _via) => {
                 banner.finish();
@@ -1209,10 +1210,18 @@ fn wait_out_approval_window(
     now: u64,
     gate_clock: &std::time::Instant,
     mut terminal_watch: Option<&mut TerminalAnswerWatch>,
+    refresh_status: &dyn Fn(),
 ) -> Result<WindowOutcome> {
     let deadline = (std::time::Instant::now() + wait).min(renewal_deadline);
+    let mut shown_at = std::time::Instant::now();
     while std::time::Instant::now() < deadline {
         std::thread::sleep(POLL_INTERVAL);
+        // Re-draw the status line now and then (Sol v0.2.27 r3): a resize
+        // repaints the screen and would leave the rest of the round bare.
+        if shown_at.elapsed() >= WAIT_TITLE_REFRESH {
+            refresh_status();
+            shown_at = std::time::Instant::now();
+        }
         if let Some(decision) = approval_decision(conn, approval_id)? {
             if decision != "expired" {
                 return apply_decision(conn, kind, thread_id, tool_name, &decision, now)
@@ -1474,14 +1483,31 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     // window, and a phone tap typed "1⏎" into Codex). The TARGET is found at
     // tap time from the session's own pts (a title mark), so the row also
     // needs that pts — no pts, no release.
+    //
+    // v0.2.27: a MULTI-select question is released too (the user: 终端永远可
+    // 答 — a held one showed no dialog at the PC at all). Its native dialog
+    // has one question tab and a Submit tab, so it is driven exactly like a
+    // one-tab interactive batch: the phone's ticks are staged and typed in one
+    // pass (toggle digits, `→` to Submit, Return), under the same 电脑优先 rule
+    // (a toggle is relative, so a PC that touched the dialog wins).
     let xtest_target = if session_window == crate::claude::SessionWindow::Window
-        && !multi_select
         && !options.is_empty()
+        && (!multi_select || options.len() <= 9)
     {
-        crate::state::session_terminal_window(&conn, &thread_id)
-            .ok()
-            .flatten()
-            .zip(crate::claude::session_terminal())
+        // v0.2.27: the remembered window is NOT required (the user: 不是已经
+        // 让做标记记住窗口了嘛？). Since v0.2.19 the target is found at tap time
+        // from the session's own pts (a title mark), so the pts is what makes
+        // a phone answer typeable; the remembered id is kept only as the
+        // row's interactive marker (0 when none was captured). If no window
+        // shows the mark at tap time, the tap reports it and the terminal's
+        // dialog stays the way to answer — never held off the terminal.
+        crate::claude::session_terminal().map(|terminal| {
+            let window = crate::state::session_terminal_window(&conn, &thread_id)
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            (window, terminal)
+        })
     } else {
         None
     };
@@ -1513,6 +1539,14 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
             crate::state::settle_stale_native_questions(&tx, &thread_id, &question_id, now)?;
         } else if let Some((window, terminal)) = &xtest_target {
             crate::state::mark_question_xtest_window(&tx, &question_id, *window, terminal)?;
+            if multi_select {
+                // A one-tab batch (see `xtest_target`).
+                let batch_id = match payload.get("tool_use_id").and_then(Value::as_str) {
+                    Some(id) if !id.is_empty() => id.to_string(),
+                    _ => format!("batch-{question_id}"),
+                };
+                crate::state::set_question_batch(&tx, &question_id, &batch_id, 0, 1)?;
+            }
             // An interactive session has AT MOST one live question at a time
             // (the tool blocks its own turn), so normally there is no stale
             // sibling. But if a PRIOR question's PostToolUse settle failed (a
@@ -1717,15 +1751,20 @@ fn release_question_batch(
     let banner = QuestionBanner::for_session(windowless);
     // v0.2.20: an INTERACTIVE session's batch is phone-answerable too, under
     // the same switch as its single questions (a verified Window session with
-    // a remembered terminal and its own pts — see `run_question_gate`). Its
+    // its own pts — see `run_question_gate`). Its
     // tabs are STAGED on tap and typed in one pass at submit time
     // (`fork_dialog::inject_batch_via_xtest`); the keyboard keeps answering
     // the same dialog meanwhile.
+    // v0.2.27: the pts is what a phone answer needs (the title mark finds
+    // the window at tap time); a remembered window is not required.
     let xtest_target = if session_window == crate::claude::SessionWindow::Window {
-        crate::state::session_terminal_window(&conn, thread_id)
-            .ok()
-            .flatten()
-            .zip(crate::claude::session_terminal())
+        crate::claude::session_terminal().map(|terminal| {
+            let window = crate::state::session_terminal_window(&conn, thread_id)
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            (window, terminal)
+        })
     } else {
         None
     };
@@ -2133,22 +2172,24 @@ pub(crate) fn run_question_answered_gate<R: Read>(reader: &mut R, now: u64) -> R
     Ok(no_opinion())
 }
 
-/// Best-effort visibility for the blocked question window: the session's
-/// terminal WINDOW TITLE says a question (or approval) is waiting on the
-/// phone (v0.2.25: the user's choice of style).
+/// Best-effort visibility for the blocked question window: ONE status line
+/// at the top of the session's terminal says a question (or approval) is
+/// waiting on the phone (v0.2.26: the user's choice of style).
 ///
 /// While this gate blocks, Claude Code renders NOTHING for the pending
 /// question — just a spinner (verified 2026-08-22 under tmux with a sleeping
-/// `PreToolUse` hook), so a person at the screen needs some sign. It used to
-/// be a cyan banner written into the terminal itself, but those bytes are
-/// not part of the TUI's picture: the spinner's repaints garbled them (the
-/// user: 画面画花了，看不清文字), and they stayed after the answer. The
-/// title changes nothing on screen: pushed on the terminal's title stack
-/// (`CSI 22;2 t`), set (`OSC 2`), and popped (`CSI 23;2 t`) when the wait
-/// ends — on every way out, `Drop` included. The receipt of a phone answer
-/// is the hook's `systemMessage`. Under tmux the title lands on the PANE and
-/// shows outside only with `set-titles on` — accepted (the user runs plain
-/// gnome-terminal; tmux window renaming was tried and dropped, v0.2.26).
+/// `PreToolUse` hook), so a person at the screen needs some sign. History:
+/// a cyan banner written at the cursor garbled with the spinner's repaints
+/// (画面画花了) and stayed after the answer; the window title was tried next
+/// and is overwritten by Claude Code's own animated title (◐◑, about once a
+/// second, measured 2026-11-25). Now: the cursor is saved (`ESC 7`), row 1 is
+/// cleared and written in reverse video, clipped to the terminal width so it
+/// never wraps, and the cursor restored (`ESC 8`) — the TUI's own cursor
+/// bookkeeping is untouched, so its repaints never collide with the line.
+/// It is re-drawn every few seconds in case something scrolled it away, and
+/// when the wait ends — on every way out, `Drop` and SIGTERM/SIGINT/SIGHUP
+/// included — the TUI is made to repaint its whole screen (a one-column
+/// resize), which takes the line off.
 ///
 /// Every write is best-effort and LOUD on failure, but never fatal: the
 /// Telegram window must survive a tty-less world (SSH, redirected fds), and
@@ -2156,16 +2197,12 @@ pub(crate) fn run_question_answered_gate<R: Read>(reader: &mut R, now: u64) -> R
 /// for a lost question.
 struct QuestionBanner {
     tty: Option<std::path::PathBuf>,
-    /// Our title is on the stack: the closing pop is owed.
-    pushed: std::cell::Cell<bool>,
+    /// Something was drawn: the closing repaint is owed.
+    painted: std::cell::Cell<bool>,
 }
 
-/// How often a long wait re-asserts its title.
+/// How often a long wait re-draws its status line.
 const WAIT_TITLE_REFRESH: Duration = Duration::from_secs(5);
-
-/// The waiting titles.
-const QUESTION_WAIT_TITLE: &str = "⏳ 有提问在等手机 · tinyCTB";
-const APPROVAL_WAIT_TITLE: &str = "⏳ 有审批在等手机 · tinyCTB";
 
 impl QuestionBanner {
     fn for_session(windowless: bool) -> Self {
@@ -2178,106 +2215,193 @@ impl QuestionBanner {
             let tty = crate::claude::session_tty_path();
             if tty.is_none() {
                 eprintln!(
-                    "tinyctb question-gate: session tty not found; the terminal title cannot \
-                     show that a question waits on Telegram"
+                    "tinyctb question-gate: session tty not found; the terminal cannot show \
+                     that a question waits on Telegram"
                 );
             }
             tty
         };
         Self {
             tty,
-            pushed: std::cell::Cell::new(false),
+            painted: std::cell::Cell::new(false),
         }
     }
 
-    fn write(&self, bytes: &[u8]) -> bool {
-        let Some(tty) = &self.tty else { return false };
-        match write_bounded(tty, bytes, BANNER_WRITE_BUDGET) {
-            Ok(()) => true,
-            Err(err) => {
-                eprintln!(
-                    "tinyctb question-gate: title write to {} gave up: {err}",
-                    tty.display()
-                );
-                false
-            }
-        }
-    }
-
-    /// Show `title` while the wait lasts (the first call pushes the
-    /// session's own title so the end can restore it).
-    fn show(&self, title: &str) {
-        if self.tty.is_none() {
-            return;
-        }
-        if !self.pushed.get() {
-            if !self.write(b"\x1b[22;2t") {
-                // Possibly cut mid-sequence: abort it, nothing to pop.
-                let _ = self.write(b"\x18");
-                return;
-            }
-            self.pushed.set(true);
+    /// Draw the top status line: the longest of `notices` (longest first)
+    /// that fits WHOLE in the terminal's width, then `detail` in what is
+    /// left (Sol v0.2.27 r2: a narrow terminal must still show how to take
+    /// the question back; only the detail is clipped).
+    fn show(&self, notices: &[&str], detail: &str) {
+        let Some(tty) = &self.tty else { return };
+        let width = terminal_columns(tty).unwrap_or(80);
+        let text = fit_status_text(notices, detail, width);
+        let line = status_line_bytes(&text, width);
+        if !self.painted.get() {
             if let Some(tty) = &self.tty {
-                arm_title_restore_on_signal(tty);
+                arm_redraw_on_signal(tty);
             }
         }
-        let set = format!("\x1b]2;{title}\x07");
-        if !self.write(set.as_bytes()) {
-            // A cut OSC string would swallow what follows: abort it.
-            let _ = self.write(b"\x18");
+        self.painted.set(true);
+        if let Err(err) = write_bounded(tty, &line, BANNER_WRITE_BUDGET) {
+            eprintln!(
+                "tinyctb question-gate: status line write to {} gave up: {err}",
+                tty.display()
+            );
         }
     }
 
     /// A held question waits on the phone.
-    fn paint_question(&self, _question: &str, _options: &[String], _multi_select: bool) {
-        self.show(QUESTION_WAIT_TITLE);
+    fn paint_question(&self, question: &str, _options: &[String], _multi_select: bool) {
+        // What it is and how to take it back come FIRST (Sol v0.2.27 r1):
+        // a narrow terminal clips the line from the end, so only the
+        // question text is shortened.
+        self.show(
+            &[
+                "⏳ tinyCTB：有提问在等手机作答（/back 收回到本终端）· ",
+                "⏳ 提问在等手机（/back 收回）· ",
+                "⏳ 等手机 /back",
+                "/back",
+            ],
+            &terminal_safe(question),
+        );
     }
 
     /// An approval waits on the phone (and its terminal dialog).
-    fn paint_approval(&self) {
-        self.show(APPROVAL_WAIT_TITLE);
+    fn paint_approval(&self, tool_name: &str) {
+        self.show(
+            &[
+                "⏳ tinyCTB：有审批在等手机（手机按钮或本终端对话框均可）· ",
+                "⏳ 审批在等手机（本终端也可答）· ",
+                "⏳ 审批等手机",
+            ],
+            &terminal_safe(tool_name),
+        );
     }
 
-    /// The wait is over: restore the session's own title.
+    /// The wait is over: make the TUI repaint, which takes the line off.
     fn finish(&self) {
-        if self.pushed.replace(false) {
-            disarm_title_restore_on_signal();
-            let _ = self.write(b"\x1b[23;2t");
+        let Some(tty) = &self.tty else { return };
+        if !self.painted.replace(false) {
+            return;
+        }
+        disarm_redraw_on_signal();
+        if let Err(err) = force_terminal_redraw(tty) {
+            eprintln!(
+                "tinyctb: could not redraw {} after the status line: {err}",
+                tty.display()
+            );
         }
     }
 }
 
-/// The tty a signal handler restores the title on (-1: none armed).
-static TITLE_RESTORE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// Display cells of `text` (wide CJK counted as 2, as `status_line_bytes`).
+fn status_cells(text: &str) -> usize {
+    text.chars()
+        .map(|ch| {
+            if (ch as u32) > 0x1100 && !ch.is_ascii() {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+/// The longest notice that fits whole in `width - 1` cells (with the line's
+/// padding), followed by the detail; the shortest one when none fits.
+fn fit_status_text(notices: &[&str], detail: &str, width: u16) -> String {
+    let budget = usize::from(width.max(2)) - 1;
+    let notice = notices
+        .iter()
+        .find(|notice| status_cells(notice) + 2 <= budget)
+        .or(notices.last())
+        .copied()
+        .unwrap_or_default();
+    // Only a notice ending in its `· ` separator takes the detail (Sol
+    // v0.2.27 r3): the short ones stand alone, so `/back` is never glued to
+    // the question text.
+    if notice.ends_with("· ") {
+        format!("{notice}{detail}")
+    } else {
+        notice.to_string()
+    }
+}
+
+/// Row 1 of the screen, written without moving the TUI's cursor: save it,
+/// go home, clear the line, the text in reverse video clipped to `width - 1`
+/// columns (wide CJK cells counted as 2, so the line never wraps), restore.
+fn status_line_bytes(text: &str, width: u16) -> Vec<u8> {
+    let budget = usize::from(width.max(2)) - 1;
+    let mut shown = String::new();
+    let mut used = 0usize;
+    for ch in format!(" {text} ").chars() {
+        let cells = status_cells(&ch.to_string());
+        if used + cells > budget {
+            break;
+        }
+        used += cells;
+        shown.push(ch);
+    }
+    format!("\x1b7\x1b[1;1H\x1b[2K\x1b[7m{shown}\x1b[0m\x1b8").into_bytes()
+}
+
+/// The terminal's width in columns, if `tty` is one.
+fn terminal_columns(tty: &std::path::Path) -> Option<u16> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let device = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(tty)
+        .ok()?;
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    (unsafe { libc::ioctl(device.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } == 0
+        && size.ws_col > 0)
+        .then_some(size.ws_col)
+}
+
+/// The tty a signal handler repaints (-1: none armed).
+static REDRAW_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 /// A cancelled turn (Ctrl+C) may end this hook with a signal before any
-/// `Drop` runs (Sol v0.2.26 r3): while our title is up, SIGTERM / SIGINT /
-/// SIGHUP first write the pop to the tty (async-signal-safe: one `write` on
-/// a descriptor opened beforehand), then exit. SIGKILL cannot be caught —
-/// then the title stays until the terminal's next title change.
-fn arm_title_restore_on_signal(tty: &std::path::Path) {
+/// `Drop` runs (Sol v0.2.26 r3): while the status line is up, SIGTERM /
+/// SIGINT / SIGHUP first force the repaint on a descriptor opened
+/// beforehand (two `ioctl`s and a `nanosleep`, raw syscalls), then exit.
+/// SIGKILL cannot be caught — then the line stays until the next repaint.
+fn arm_redraw_on_signal(tty: &std::path::Path) {
     use std::os::fd::IntoRawFd;
     use std::os::unix::fs::OpenOptionsExt as _;
     let Ok(device) = std::fs::OpenOptions::new()
-        .append(true)
+        .read(true)
+        .write(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(tty)
     else {
         return;
     };
     let fd = device.into_raw_fd();
-    let previous = TITLE_RESTORE_FD.swap(fd, std::sync::atomic::Ordering::SeqCst);
+    let previous = REDRAW_FD.swap(fd, std::sync::atomic::Ordering::SeqCst);
     if previous >= 0 {
         unsafe {
             libc::close(previous);
         }
     }
-    extern "C" fn restore_title_and_exit(signal: libc::c_int) {
-        let fd = TITLE_RESTORE_FD.load(std::sync::atomic::Ordering::SeqCst);
+    extern "C" fn redraw_and_exit(signal: libc::c_int) {
+        let fd = REDRAW_FD.load(std::sync::atomic::Ordering::SeqCst);
         if fd >= 0 {
-            let pop = b"\x1b[23;2t";
             unsafe {
-                libc::write(fd, pop.as_ptr().cast(), pop.len());
+                let mut size: libc::winsize = std::mem::zeroed();
+                if libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) == 0 && size.ws_col >= 2 {
+                    let mut narrower = size;
+                    narrower.ws_col -= 1;
+                    libc::ioctl(fd, libc::TIOCSWINSZ, &narrower);
+                    let pause = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 120_000_000,
+                    };
+                    libc::nanosleep(&pause, std::ptr::null_mut());
+                    libc::ioctl(fd, libc::TIOCSWINSZ, &size);
+                }
             }
         }
         unsafe {
@@ -2286,22 +2410,19 @@ fn arm_title_restore_on_signal(tty: &std::path::Path) {
     }
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         unsafe {
-            libc::signal(
-                signal,
-                restore_title_and_exit as *const () as libc::sighandler_t,
-            );
+            libc::signal(signal, redraw_and_exit as *const () as libc::sighandler_t);
         }
     }
 }
 
-/// The title is restored normally: back to default signal handling.
-fn disarm_title_restore_on_signal() {
+/// The repaint is done normally: back to default signal handling.
+fn disarm_redraw_on_signal() {
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         unsafe {
             libc::signal(signal, libc::SIG_DFL);
         }
     }
-    let fd = TITLE_RESTORE_FD.swap(-1, std::sync::atomic::Ordering::SeqCst);
+    let fd = REDRAW_FD.swap(-1, std::sync::atomic::Ordering::SeqCst);
     if fd >= 0 {
         unsafe {
             libc::close(fd);
@@ -2309,13 +2430,53 @@ fn disarm_title_restore_on_signal() {
     }
 }
 
-/// Every way out of a gate restores the title — an error propagated with
+/// Every way out of a gate takes the line down — an error propagated with
 /// `?` included (Sol v0.2.25 r1). The explicit `finish()` calls run first on
 /// the normal exits; this is the backstop (a no-op once finished).
 impl Drop for QuestionBanner {
     fn drop(&mut self) {
         self.finish();
     }
+}
+
+/// Make the session's TUI repaint its whole screen, as a window resize does:
+/// narrow the pty by one column, give the TUI a moment, restore the size.
+/// The kernel sends SIGWINCH to the tty's foreground process group on each
+/// change. The terminal emulator is not involved (it keeps its own size, and
+/// the pty is back to it at once). No-op on a tty narrower than 2 columns.
+#[cfg(unix)]
+fn force_terminal_redraw(tty: &std::path::Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let device = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(tty)?;
+    let fd = device.as_raw_fd();
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if size.ws_col < 2 {
+        return Ok(());
+    }
+    let mut narrower = size;
+    narrower.ws_col -= 1;
+    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &narrower) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    std::thread::sleep(Duration::from_millis(120));
+    // Restored whatever happens above: never leave the pty a column short.
+    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &size) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn force_terminal_redraw(_tty: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Total time one banner write may spend before giving up. Generous for a
@@ -3133,13 +3294,11 @@ mod tests {
                 // dead temp file (or worse, a reused one another test
                 // asserts on).
                 crate::state::EnvVarGuard::clear("TINYCTB_TEST_SESSION_TTY"),
-                // A session whose claude process and pts are known (only
-                // RECORDED by the gate, never written to), so a remembered
-                // window releases; tests that need "no pts" clear it.
-                crate::state::EnvVarGuard::set(
-                    "TINYCTB_TEST_SESSION_TERMINAL",
-                    "4242:777:/dev/pts/99",
-                ),
+                // No known pts by default: since v0.2.27 a Window session
+                // with its pts RELEASES every question to its terminal, so the
+                // held-path tests run as a session whose pts is unknown;
+                // tests of the release set the seam themselves.
+                crate::state::EnvVarGuard::clear("TINYCTB_TEST_SESSION_TERMINAL"),
             ];
             crate::config::write_daemon_config(&DaemonConfig {
                 version: 1,
@@ -5342,6 +5501,50 @@ mod tests {
         );
     }
 
+    /// v0.2.27 (终端永远可答): an interactive session's single MULTI-select
+    /// question is released too — the native dialog renders at once — as a
+    /// one-tab batch with a poll on the phone.
+    #[test]
+    fn a_window_session_releases_a_single_multi_select_question() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("window-multi", true, 30);
+        let _terminal =
+            crate::state::EnvVarGuard::set("TINYCTB_TEST_SESSION_TERMINAL", "4242:777:/dev/pts/99");
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        crate::state::set_session_terminal_window(&conn, "sess-q", 0x2a526d7, 1000)
+            .expect("seed window");
+        drop(conn);
+        let mut payload = question_payload();
+        payload["tool_use_id"] = json!("toolu-multi-w");
+        payload["tool_input"]["questions"][0]["multiSelect"] = json!(true);
+        let started = std::time::Instant::now();
+        assert_eq!(question_gate(payload), json!({}), "the real dialog renders");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "not held waiting for the phone"
+        );
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let (window, batch, seq, total): (Option<i64>, Option<String>, Option<i64>, Option<i64>) =
+            conn.query_row(
+                "SELECT inject_window, batch_id, batch_seq, batch_total FROM pending_questions
+                 WHERE thread_id = 'sess-q'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("row");
+        assert_eq!(window, Some(0x2a526d7));
+        assert_eq!(batch.as_deref(), Some("toolu-multi-w"));
+        assert_eq!((seq, total), (Some(0), Some(1)));
+        let payload_json: String = conn
+            .query_row(
+                "SELECT payload_json FROM outbound_events WHERE event_type = 'question_request'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("event");
+        assert!(payload_json.contains("\"poll\":{"), "{payload_json}");
+    }
+
     /// v0.2.17: an interactive (Window) session whose terminal window is
     /// REMEMBERED releases its single-select question to that terminal's native
     /// selector (no_opinion, no held banner) and marks the row so a phone tap is
@@ -5350,6 +5553,8 @@ mod tests {
     fn a_window_session_with_a_remembered_window_releases_and_marks_it_for_xtest() {
         let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("xtest-release", true, 30);
+        let _terminal =
+            crate::state::EnvVarGuard::set("TINYCTB_TEST_SESSION_TERMINAL", "4242:777:/dev/pts/99");
         // A Window session (the GateEnv default) that we have already captured
         // a terminal window for.
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
@@ -5492,11 +5697,40 @@ mod tests {
         assert_eq!(inject_window, None, "never marked for XTEST");
     }
 
-    /// v0.2.17 guard: a Window session with NO remembered window keeps the
-    /// unchanged HELD path — the phone fills the answer, the row is never marked
-    /// for XTEST — so nothing is released to a window we cannot address.
+    /// v0.2.27 (终端永远可答): a Window session with its pts known releases
+    /// the question to its terminal even when no window was ever remembered
+    /// — the title mark finds the window at tap time. The row is marked for
+    /// XTEST with window 0 (the marker only).
     #[test]
-    fn a_window_session_without_a_remembered_window_still_holds() {
+    fn a_window_session_without_a_remembered_window_is_released() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("no-window-release", true, 120);
+        let _terminal =
+            crate::state::EnvVarGuard::set("TINYCTB_TEST_SESSION_TERMINAL", "4242:777:/dev/pts/99");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            question_gate(question_payload()),
+            json!({}),
+            "the real dialog renders"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5), "not held");
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let (inject_window, tty): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT inject_window, inject_tty FROM pending_questions WHERE thread_id = 'sess-q'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(inject_window, Some(0));
+        assert_eq!(tty.as_deref(), Some("/dev/pts/99"));
+    }
+
+    /// The held path that remains (v0.2.27): a session whose pts is unknown
+    /// (the GateEnv default) cannot have a phone answer typed into it, so
+    /// the phone fills the answer while the gate holds.
+    #[test]
+    fn a_session_without_a_known_pts_lets_the_phone_fill_the_answer() {
         let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("no-window-holds", true, 120);
         // A tap lands from the phone after the gate is already holding.
@@ -5624,27 +5858,101 @@ mod tests {
         drop(sentinels);
     }
 
-    /// Sol v0.2.26 r3: a hook ended by SIGTERM (a cancelled turn) still pops
-    /// the waiting title. Run in a child process (the handler exits it).
+    /// Every status line the gate draws: saved cursor, row 1 cleared, the
+    /// text in reverse video, cursor restored — and nothing else.
+    fn assert_status_line(painted: &str, needle: &str) {
+        assert!(!painted.is_empty(), "nothing drawn");
+        for line in painted.split_inclusive("\u{1b}8") {
+            assert!(
+                line.starts_with("\u{1b}7\u{1b}[1;1H\u{1b}[2K\u{1b}[7m"),
+                "{painted:?}"
+            );
+            assert!(line.ends_with("\u{1b}[0m\u{1b}8"), "{painted:?}");
+            assert!(line.contains(needle), "{painted:?}");
+            assert_eq!(
+                line.matches('\u{1b}').count(),
+                6,
+                "only our own ANSI: {painted:?}"
+            );
+        }
+    }
+
+    /// v0.2.26: the status line never wraps — clipped to width - 1 cells,
+    /// wide CJK cells counted as 2.
     #[test]
-    fn a_signalled_hook_still_restores_the_title() {
+    fn the_status_line_is_clipped_to_the_terminal_width() {
+        let bytes = status_line_bytes("等手机作答等手机作答", 12);
+        let text = String::from_utf8(bytes).expect("utf8");
+        let shown = text
+            .trim_start_matches("\u{1b}7\u{1b}[1;1H\u{1b}[2K\u{1b}[7m")
+            .trim_end_matches("\u{1b}[0m\u{1b}8");
+        // " " + 5 wide chars = 11 cells = width - 1.
+        assert_eq!(shown, " 等手机作答");
+    }
+
+    /// Sol v0.2.27 r2: a narrow terminal still shows how to take the
+    /// question back — a shorter notice is chosen whole; only the question
+    /// text is clipped.
+    #[test]
+    fn a_narrow_terminal_keeps_the_back_hint() {
+        let notices = [
+            "⏳ tinyCTB：有提问在等手机作答（/back 收回到本终端）· ",
+            "⏳ 提问在等手机（/back 收回）· ",
+            "⏳ 等手机 /back",
+            "/back",
+        ];
+        for width in [8u16, 16, 20, 36, 50, 80, 120] {
+            let text = fit_status_text(&notices, "Pick one", width);
+            let line = String::from_utf8(status_line_bytes(&text, width)).expect("utf8");
+            // A whole `/back`, never glued to the question (`/backPick`).
+            assert!(
+                line.contains("/back ") || line.contains("/back）"),
+                "width {width}: {line:?}"
+            );
+        }
+        let wide = fit_status_text(&notices, "题", 120);
+        assert!(wide.starts_with("⏳ tinyCTB：有提问在等手机作答"), "{wide}");
+    }
+
+    /// Sol v0.2.26 r3: a hook ended by SIGTERM (a cancelled turn) still
+    /// forces the repaint, and leaves the pty exactly its size. Run in a
+    /// child process (the handler exits it) on a pty this test owns.
+    #[test]
+    fn a_signalled_hook_still_repaints_and_restores_the_size() {
         if let Ok(path) = std::env::var("TINYCTB_TEST_SIGNAL_CHILD") {
-            // Child: arm on the given file, say so, wait to be signalled.
-            arm_title_restore_on_signal(std::path::Path::new(&path));
+            // Child: arm on the given pty, say so, wait to be signalled.
+            arm_redraw_on_signal(std::path::Path::new(&path));
             println!("armed");
             std::thread::sleep(Duration::from_secs(20));
             return;
         }
-        let file = std::env::temp_dir().join(format!("tinyctb-sigtitle-{}", std::process::id()));
-        fs::write(&file, "").expect("file");
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        let size = libc::winsize {
+            ws_row: 30,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &size,
+            )
+        };
+        assert_eq!(opened, 0, "openpty");
+        let pts = fs::read_link(format!("/proc/self/fd/{slave}")).expect("pts path");
         let mut child = std::process::Command::new(std::env::current_exe().expect("exe"))
             .args([
                 "--exact",
-                "approvals::tests::a_signalled_hook_still_restores_the_title",
+                "approvals::tests::a_signalled_hook_still_repaints_and_restores_the_size",
                 "--nocapture",
                 "--test-threads=1",
             ])
-            .env("TINYCTB_TEST_SIGNAL_CHILD", &file)
+            .env("TINYCTB_TEST_SIGNAL_CHILD", &pts)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -5664,9 +5972,58 @@ mod tests {
         }
         let status = child.wait().expect("wait");
         assert_eq!(std::os::unix::process::ExitStatusExt::signal(&status), None);
-        assert_eq!(status.code(), Some(128 + libc::SIGTERM));
-        assert_eq!(fs::read(&file).expect("read"), b"\x1b[23;2t");
-        let _ = fs::remove_file(&file);
+        assert_eq!(status.code(), Some(128 + libc::SIGTERM), "the handler ran");
+        let mut after: libc::winsize = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::ioctl(slave, libc::TIOCGWINSZ, &mut after) },
+            0
+        );
+        assert_eq!((after.ws_row, after.ws_col), (30, 100));
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+    }
+
+    /// v0.2.25: the closing redraw narrows a real pty by one column and puts
+    /// it back exactly — never leaves it a column short.
+    #[test]
+    fn the_closing_redraw_restores_the_pty_size() {
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        let mut size = libc::winsize {
+            ws_row: 30,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &size,
+            )
+        };
+        assert_eq!(opened, 0, "openpty");
+        let name = fs::read_link(format!("/proc/self/fd/{slave}")).expect("pts path");
+        force_terminal_redraw(&name).expect("redraw");
+        size = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::ioctl(slave, libc::TIOCGWINSZ, &mut size) },
+            0
+        );
+        assert_eq!((size.ws_row, size.ws_col), (30, 100));
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+        // Not a tty: an error, nothing else.
+        let plain = std::env::temp_dir().join(format!("tinyctb-notty-{}", std::process::id()));
+        fs::write(&plain, "").expect("file");
+        assert!(force_terminal_redraw(&plain).is_err());
+        let _ = fs::remove_file(&plain);
     }
 
     /// The user's law for the blocked window: the terminal must always show
@@ -5703,13 +6060,9 @@ mod tests {
         let result = question_gate(question_payload());
         handle.join().expect("answering thread");
 
-        // v0.2.25: only the window title — pushed, set, popped — and not
-        // one visible byte in the terminal itself.
+        // v0.2.26: one top status line, drawn without moving the cursor.
         let painted = fs::read_to_string(&tty).expect("painted tty");
-        assert_eq!(
-            painted, "\u{1b}[22;2t\u{1b}]2;⏳ 有提问在等手机 · tinyCTB\u{7}\u{1b}[23;2t",
-            "{painted:?}"
-        );
+        assert_status_line(&painted, "有提问在等手机作答（/back 收回到本终端）");
         // The durable receipt rides the hook reply itself.
         assert_eq!(
             result["systemMessage"], "tinyCTB：已由手机作答「SQLite」",
@@ -5748,10 +6101,7 @@ mod tests {
         );
         // v0.2.25: the title shows the wait and is restored at the hand-over.
         let painted = fs::read_to_string(&tty).expect("painted tty");
-        assert_eq!(
-            painted, "\u{1b}[22;2t\u{1b}]2;⏳ 有提问在等手机 · tinyCTB\u{7}\u{1b}[23;2t",
-            "{painted:?}"
-        );
+        assert_status_line(&painted, "有提问在等手机作答（/back 收回到本终端）");
         // The settle stamp is wall-clock time, not the gate's start instant:
         // a stamp equal to `created_at` collapses "born" and "handed back"
         // into one millisecond and forensics can no longer order them
@@ -6013,8 +6363,8 @@ mod tests {
         assert!(
             fs::read_to_string(&tty)
                 .expect("fake tty")
-                .contains(QUESTION_WAIT_TITLE),
-            "and still gets its waiting title"
+                .contains("有提问在等手机作答"),
+            "and still gets its status line"
         );
     }
 
@@ -6313,10 +6663,7 @@ mod tests {
         // v0.2.25: model-authored text never reaches the tty at all — only
         // the fixed title sequences do.
         let painted = fs::read_to_string(&tty).expect("painted tty");
-        assert_eq!(
-            painted, "\u{1b}[22;2t\u{1b}]2;⏳ 有提问在等手机 · tinyCTB\u{7}\u{1b}[23;2t",
-            "{painted:?}"
-        );
+        assert_status_line(&painted, "有提问在等手机作答（/back 收回到本终端）");
         // The display receipt is sanitized; the tool-contract copy is
         // byte-exact — both, deliberately.
         assert_eq!(

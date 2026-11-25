@@ -4235,10 +4235,11 @@ pub(crate) fn question_prompt(
                 thread_id,
                 options: serde_json::from_str::<Vec<String>>(&options_json).unwrap_or_default(),
                 native_attach: native.unwrap_or(0) != 0,
-                // A batch needs a real tab index and MORE than one tab; anything
-                // else is an ordinary single-question row.
+                // A batch needs a real tab index within its tab count. A
+                // one-tab batch is an interactive multi-select question
+                // (v0.2.27), typed like any batch.
                 batch: match (seq, total) {
-                    (Some(seq), Some(total)) if seq >= 0 && total > 1 && seq < total => {
+                    (Some(seq), Some(total)) if seq >= 0 && total >= 1 && seq < total => {
                         Some(QuestionBatch {
                             seq: seq as usize,
                             total: total as usize,
@@ -4350,7 +4351,7 @@ pub(crate) fn batch_rows(
         let (Some(seq), Some(total)) = (seq, total) else {
             continue;
         };
-        if seq < 0 || total <= 1 || seq >= total {
+        if seq < 0 || total < 1 || seq >= total {
             continue;
         }
         batch.total = batch.total.max(total as usize);
