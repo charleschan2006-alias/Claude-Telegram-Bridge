@@ -1522,6 +1522,17 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     // row for it is stale — closing it now makes its phone button read `Answered`
     // and BAIL, instead of a stale tap injecting an old option into this (or a
     // later) dialog.
+    // A RELEASED question's phone window is the long one, as for a batch
+    // (v0.2.29, the user's choice): nothing blocks on it — the terminal's
+    // dialog is live — so the phone's buttons stay good until either side
+    // answers, instead of closing after the hold timeout (「手机答复窗口已关
+    // 闭」 an hour in while the dialog still waited). The hold timeout keeps
+    // governing the HELD path, where the hook does block.
+    let phone_window = if released {
+        WINDOWLESS_APPROVAL_WAIT
+    } else {
+        wait
+    };
     {
         let tx = conn.unchecked_transaction()?;
         crate::state::create_pending_question(
@@ -1532,7 +1543,7 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
             &options,
             multi_select,
             now,
-            now + wait.as_millis() as u64,
+            now + phone_window.as_millis() as u64,
         )?;
         if native_attach {
             crate::state::mark_question_native_attach(&tx, &question_id)?;
@@ -5740,6 +5751,16 @@ mod tests {
             .expect("row");
         assert_eq!(inject_window, Some(0));
         assert_eq!(tty.as_deref(), Some("/dev/pts/99"));
+        // v0.2.29: a released question's phone window is the long one (the
+        // configured hold timeout here is 120s).
+        let (created, expires): (i64, i64) = conn
+            .query_row(
+                "SELECT created_at, expires_at FROM pending_questions WHERE thread_id = 'sess-q'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("window");
+        assert_eq!(expires - created, 86_400_000);
     }
 
     /// The held path that remains (v0.2.27): a session whose pts is unknown
